@@ -1,0 +1,58 @@
+# Build output
+build/
+cmake-build-*/
+.cache/
+compile_commands.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.user
+*.swp
+.DS_Store
+Thumbs.db
+
+# Audio and video never go into the repo (copyright, size)
+*.wav
+*.mp3
+*.mp4
+*.m4a
+*.flac
+*.ogg
+*.webm
+*.mkv
+*.mov
+*.aif
+*.aiff
+*.aac
+*.opus
+*.wma
+*:Zone.Identifier
+testdata/
+sg.log
+
+# Downloaded tool binaries (the app installs them itself at runtime)
+yt-dlp
+yt-dlp_linux
+yt-dlp.exe
+ffmpeg
+ffmpeg.exe
+ffprobe
+ffprobe.exe
+deno
+deno.exe
+
+# Internal working notes and local dev tooling (kept locally, not published)
+CLAUDE.md
+.claude/
+HANDOVER.md
+HANDOVER_NEXT.md
+UI_BRAND.md
+BRAND.md
+README.brand.md
+tools/beat-proto/
+scripts/save-point.sh
+
+# Brand kit: only what the build and the README need is tracked (added with `git add -f`):
+# lockup dark/light, icon 1024/256, mark dark/light, BrandColours.h
+brand/
