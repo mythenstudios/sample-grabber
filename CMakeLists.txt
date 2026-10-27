@@ -36,7 +36,8 @@ set(SG_SOURCES
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
     Source/Downloader.cpp
-    Source/ToolManager.cpp)
+    Source/ToolManager.cpp
+    Source/Storage.cpp)
 
 # Brand assets (UI_BRAND.md 1): SVGs and fonts (SIL OFL) as BinaryData, accessed via BinaryData.h.
 # SVGs always; fonts only if all four files exist (otherwise default font, SG_HAS_BRAND_FONTS=0).

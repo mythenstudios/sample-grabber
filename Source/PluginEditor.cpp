@@ -207,6 +207,12 @@ SampleGrabberEditor::SampleGrabberEditor (SampleGrabberProcessor& p)
         statusText = "TOOLS MISSING" + kDot + "CLICK INSTALL TOOLS (YT-DLP, DENO, FFMPEG ~220 MB)";
     processor.tools->requestAutoCheck();
 
+    // State restored before the editor existed: show its note (source missing) and URL
+    lastEmbedWarn = processor.getEmbedWarnVersion();
+    lastStateVersion = processor.getStateVersion();
+    if (processor.getRestoreNote().isNotEmpty())
+        applyRestoredState();
+
     // Developer aid (SG_SNAPSHOT only): preset the status line for the image, e.g. to check long tool messages
     if (juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT", {}).isNotEmpty())
     {
@@ -378,7 +384,9 @@ std::function<void (Downloader::Result)> SampleGrabberEditor::doneCallback()
 
         if (r.ok)
         {
-            safe->loadFromFile (r.file);
+            const auto url = std::exchange (safe->pendingGrabUrl, juce::String());
+            safe->loadFromFile (r.file, url);
+            safe->processor.cache->requestAutoClean();   // after each finished grab/import (new file is registered as in use)
         }
         else
         {
@@ -529,6 +537,7 @@ void SampleGrabberEditor::startGrab()
 
     if (text.startsWithIgnoreCase ("http://") || text.startsWithIgnoreCase ("https://"))
     {
+        pendingGrabUrl = text;
         beginBusy ("STARTING");
         downloader.grab (text, progressCallback(), doneCallback());
         return;
@@ -560,9 +569,9 @@ void SampleGrabberEditor::startGrab()
     }
 }
 
-void SampleGrabberEditor::loadFromFile (const juce::File& f)
+void SampleGrabberEditor::loadFromFile (const juce::File& f, const juce::String& sourceUrl)
 {
-    if (processor.loadSample (f))
+    if (processor.loadSample (f, true, sourceUrl))
     {
         waveform.resetView();
         pads.refreshThumbs();
@@ -587,6 +596,41 @@ void SampleGrabberEditor::syncSliceModeButtons()
         .setToggleState (true, juce::dontSendNotification);   // radio group switches the others off
 }
 
+void SampleGrabberEditor::applyRestoredState()
+{
+    lastStateVersion = processor.getStateVersion();
+    if (processor.hasSample())
+    {
+        waveform.resetView();
+        pads.refreshThumbs();
+    }
+    syncSliceModeButtons();
+    waveform.repaint();
+    pads.repaint();
+    repaintInfo();
+
+    if (busy)
+        return;   // a running grab owns the status line
+
+    const auto note = processor.getRestoreNote();
+    const auto url = processor.getSourceUrl();
+    if (note.isNotEmpty())
+    {
+        statusText = note;
+        isError = ! processor.hasSample();
+        progress = 0.0f;
+        if (url.isNotEmpty())
+            urlField.setText (url, false);   // GRAB fetches the source again
+    }
+    else if (processor.hasSample())
+    {
+        statusText = "READY" + kDot + prettyName (processor.getLoadedFile());
+        isError = false;
+        progress = 1.0f;
+    }
+    repaint();
+}
+
 void SampleGrabberEditor::goBack()
 {
     if (busy)
@@ -609,9 +653,19 @@ void SampleGrabberEditor::dragOut (int pad)
     if (! processor.hasSample())
         return;
 
-    const auto f = processor.exportRegion (pad);
+    // Normally a hard link of the pre-rendered file; synchronous render only if staging is not ready
+    const auto f = processor.prepareDragFile (pad);
     if (f.existsAsFile())
+    {
         juce::DragAndDropContainer::performExternalDragDropOfFiles (juce::StringArray (f.getFullPathName()), false, this);
+    }
+    else
+    {
+        statusText = "EXPORT FAILED" + kDot + "CHECK FOLDER";   // details in sg.log ([SG] drag: ...)
+        isError = true;
+        progress = 0.0f;
+        repaint (progR);
+    }
 }
 
 //==============================================================================
@@ -670,6 +724,7 @@ bool SampleGrabberEditor::openLocalFile (const juce::File& f)
     {
         if (! downloader.isBusy())
         {
+            pendingGrabUrl.clear();
             beginBusy ("CONVERTING");
             downloader.importFile (f, progressCallback(), doneCallback());
         }
@@ -685,6 +740,22 @@ void SampleGrabberEditor::timerCallback()
     // Theme switched in another plugin instance: follow
     if (ui::theme() != shownTheme)
         refreshTheme();
+
+    // Host restored a plugin state while the editor is open
+    if (processor.getStateVersion() != lastStateVersion)
+        applyRestoredState();
+
+    // Selection too long/large to embed in the project: say so once per sample
+    if (processor.getEmbedWarnVersion() != lastEmbedWarn)
+    {
+        lastEmbedWarn = processor.getEmbedWarnVersion();
+        if (! busy)
+        {
+            statusText = "SELECTION TOO LONG TO SAVE IN PROJECT" + kDot + "LINK KEPT";
+            isError = false;
+            repaint (progR);
+        }
+    }
 
     // Indeterminate progress: only the bar stripe, only while busy
     if (busy)

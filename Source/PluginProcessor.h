@@ -2,6 +2,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include "ToolManager.h"
+#include "Storage.h"
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -108,7 +109,8 @@ public:
 
     // ---- Message-Thread-API (UI) ----
     // recordHistory = true: the previous state (sample, trim, slice mode, tempo octave) is pushed onto the BACK stack.
-    bool loadSample (const juce::File& file, bool recordHistory = true);
+    // sourceUrl: link the file was grabbed from (saved in the plugin state for re-grabbing), empty for local files.
+    bool loadSample (const juce::File& file, bool recordHistory = true, const juce::String& sourceUrl = {});
 
     // BACK: return to the state before the last load without re-fetching (message thread).
     // The stack lives in RAM only (not in plugin state): at most maxHistoryDepth levels, oldest are dropped first.
@@ -173,8 +175,25 @@ public:
     // (outside that range BEAT would silently fall back to GRID).
     bool canShiftBpmOctave (int delta) const;
 
-    // Renders a pad (0..15) or the whole selection (fullRegionPad) incl. gain/pitch/speed/fades as 24-bit WAV
-    juce::File exportRegion (int pad);
+    // Drag-out (message thread): finished 24-bit WAV of a pad (0..15) or the whole selection (fullRegionPad) incl.
+    // gain/pitch/speed/fades in the export folder <Music>/Sample Grabber/<title>/. Normally a hard link/copy of the file
+    // the background worker pre-rendered; if that is not ready, rendered synchronously (logged). Empty = nothing to export.
+    // Names carry a hash of the audio content + parameters: an existing file is reused, never overwritten.
+    juce::File prepareDragFile (int pad);
+
+    // Plugin state restore (setStateInformation) -> editor refresh: bumped after every restore (message thread)
+    int getStateVersion() const { return stateVersion.load(); }
+    juce::String getRestoreNote() const;     // e.g. "SOURCE MISSING - USING SAVED SELECTION", empty = normal
+    juce::String getSourceUrl() const;       // link of the loaded sample, empty for local files
+
+    // Self tests (SG_STATE_SELFTEST / SG_EXPORT_SELFTEST): wait until the background worker has nothing left to do
+    bool waitForBackgroundIdle (int timeoutMs);
+    size_t getEmbeddedAudioBytes() const;
+    bool isStagedReady (int pad) const;      // staged file for the current state is ready (fast drag path)
+    static void setEmbedCapForTest (size_t bytes);
+
+    // Selection too long/large to embed in the project (> 10 min or > 32 MB FLAC): bumped once per sample (editor note)
+    int getEmbedWarnVersion() const { return embedWarnVersion.load(); }
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -186,6 +205,7 @@ public:
     // External tools (yt-dlp/deno/ffmpeg), one object per process. Keeps the ToolManager alive as long as a
     // plugin instance exists (installation continues when the editor is closed). Never use on the audio thread.
     juce::SharedResourcePointer<ToolManager> tools;
+    juce::SharedResourcePointer<CacheManager> cache;   // cache size/cleaning, one per process
 
 private:
     struct RenderedAudio
@@ -193,9 +213,55 @@ private:
         juce::AudioBuffer<float> buffer;
         int regionStart = 0, regionEnd = 0;   // source range (samples in the original) covered by this render
         double speed = 1.0;                   // tempo factor: render length = source length / speed
+        float pitch = 0.0f;                   // semitones the render was made with
     };
 
     class Renderer;
+    class BackgroundWorker;
+
+    // Everything an export needs, captured at one moment (any thread except audio). The writer works only on this.
+    struct ExportJob
+    {
+        std::shared_ptr<juce::AudioBuffer<float>> buf;
+        std::shared_ptr<RenderedAudio> rnd;   // matching pitch/speed render, nullptr = original or needsRender
+        bool stretched = false;               // pitch/speed active (and selection long enough to render)
+        bool needsRender = false;             // stretched, but no matching render yet: the writer renders itself
+        int pad = 0;
+        bool whole = false;
+        int selStart = 0, selEnd = 0;         // selection in the original
+        int srcStart = 0, srcEnd = 0;         // pad (or selection) in the original
+        double rate = 44100.0, speed = 1.0;
+        float pitch = 0.0f, gainDb = 0.0f, fadeInPct = 0.0f, fadeOutPct = 0.0f, fadeShape = 0.0f;
+        juce::String title;
+        double outputSeconds() const { return (double) (srcEnd - srcStart) / (stretched ? speed : 1.0) / rate; }
+    };
+
+    bool captureExportJob (int pad, ExportJob& job) const;
+    static juce::uint64 hashExportJob (const ExportJob&);
+    static juce::String exportFileName (const ExportJob&, juce::uint64 hash);
+    static bool writeExport (const ExportJob&, const juce::File& target, const std::function<bool()>& shouldAbort);
+    juce::uint64 computeStageKey() const;   // cheap fingerprint of everything that changes the exports (no audio scan)
+    juce::uint64 computeEmbedKey() const;   // sample + selection
+
+    // State restore, applied on the message thread
+    struct RestoreInfo
+    {
+        juce::String path, url;
+        float trimStart = 0.0f, trimEnd = 1.0f;
+        int sliceMode = (int) SliceMode::transient;
+        float bpm = 0.0f;
+        int bpmOctave = 0;
+        bool hasBpm = false;
+        std::shared_ptr<const juce::MemoryBlock> flac;   // embedded selection audio, nullptr = none
+        float embTrimStart = 0.0f, embTrimEnd = 1.0f;    // selection the embedded audio covers (original coordinates)
+    };
+    void applyRestore (const RestoreInfo&);
+    void applyPendingRestore();   // message thread: applies pendingRestore (newest wins), then clears it
+    bool installFromReader (juce::AudioFormatReader& reader, const juce::File& file, bool recordHistory, const juce::String& url,
+                            bool embedded = false, float embTrimStart = 0.0f, float embTrimEnd = 1.0f);
+    void setMeta (const juce::File& file, const juce::String& url, bool embedded, float embTrimStart, float embTrimEnd);
+    void seedEmbedded (std::shared_ptr<const juce::MemoryBlock> flac);   // restored FLAC = whole current selection
+    void updateInUse();   // in-use registry for cache cleaning (loaded file + BACK history), message thread
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     static std::shared_ptr<RenderedAudio> renderStretched (const juce::AudioBuffer<float>& src, int a, int b, double sr,
@@ -221,6 +287,9 @@ private:
         std::shared_ptr<juce::AudioBuffer<float>> sample;   // shared pointer, no copy of the buffer
         std::vector<float> flux;
         juce::File file;
+        juce::String url;
+        bool embedded = false;                              // sample = embedded selection, file is the missing original
+        float embTrimStart = 0.0f, embTrimEnd = 1.0f;
         double sampleRate = 44100.0;
         int bitDepth = 16;
         float trimStart = 0.0f, trimEnd = 1.0f;
@@ -268,6 +337,26 @@ private:
     std::atomic<float>* fadeShapeParam = nullptr;
     std::atomic<float>* loopParam = nullptr;
 
+    // Metadata for state, export names and the editor (message thread writes; getStateInformation and the worker read).
+    // Never touched by the audio thread, so a normal lock is fine.
+    mutable juce::CriticalSection metaLock;
+    juce::String metaPath;          // path written to the state (original file, also when it is missing)
+    juce::String metaTitle;         // export folder/file title
+    juce::String metaUrl;           // link the sample was grabbed from
+    juce::String restoreNote;
+    bool embeddedMode = false;      // sample is the embedded selection of a missing source
+    float embOrigTrimStart = 0.0f, embOrigTrimEnd = 1.0f;   // embedded audio = this range of the original (normalised)
+    std::shared_ptr<const RestoreInfo> pendingRestore;       // set by setStateInformation until applyRestore ran
+    std::shared_ptr<const juce::MemoryBlock> embeddedFlac;   // cached FLAC of the current selection (worker encodes)
+    juce::uint64 embeddedFlacKey = 0;                        // computeEmbedKey() it belongs to
+    int embeddedFlacSerial = -1;                             // sampleSerial it was encoded from
+    float embeddedFlacTrimStart = 0.0f, embeddedFlacTrimEnd = 1.0f;   // selection it covers (normalised, current sample)
+    std::atomic<juce::uint64> embeddedDoneKey { 0 };         // key the worker last handled (encoded or skipped)
+
+    std::atomic<int> embedWarnSerial { -1 }, embedWarnVersion { 0 };
+    std::atomic<int> sampleSerial { 0 };   // +1 per installed sample (identity for keys, unlike recycled pointers)
+    std::atomic<int> stateVersion { 0 };
+
     std::unique_ptr<Renderer> renderer;
     std::atomic<bool> renderDirty { false }, renderBusy { false };
     std::atomic<juce::uint32> lastChangeMs { 0 };
@@ -302,5 +391,8 @@ private:
     double xfadePos = 0.0;
     int xfadeEnd = 0, xfadeLeft = 0, xfadeTotal = 1;
 
+    std::unique_ptr<BackgroundWorker> worker;   // staging + FLAC; declared last -> stopped first in the destructor
+
+    JUCE_DECLARE_WEAK_REFERENCEABLE (SampleGrabberProcessor)
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SampleGrabberProcessor)
 };

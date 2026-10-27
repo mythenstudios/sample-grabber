@@ -36,7 +36,8 @@ private:
     void onFetchClicked();
     void startGrab();
     void beginBusy (const juce::String& status);
-    void loadFromFile (const juce::File&);
+    void loadFromFile (const juce::File&, const juce::String& sourceUrl = {});
+    void applyRestoredState();                     // after setStateInformation: refresh widgets, note, URL field
     bool openLocalFile (const juce::File&);   // true = file type supported
     void goBack();
     void repaintInfo();
@@ -96,6 +97,9 @@ private:
     bool busy = false, isError = false, wasPlaying = false, dragOver = false, lastRendering = false;
     bool toolsBusy = false;                        // status line/progress currently belong to the ToolManager
     int lastToolRun = 0;                           // ToolManager::getRunCounter() at the last sync
+    int lastStateVersion = 0;                      // processor.getStateVersion() already shown
+    int lastEmbedWarn = 0;                         // processor.getEmbedWarnVersion() already shown
+    juce::String pendingGrabUrl;                   // link of the running grab (saved with the sample for re-grabbing)
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SampleGrabberEditor)
 };

@@ -2,12 +2,13 @@
 #include "PluginProcessor.h"
 #include "IconButton.h"
 #include "ToolManager.h"
+#include "Storage.h"
 #include "ui/SGLookAndFeel.h"
 #include <functional>
 
 // Settings overlay (gear in the header): child component on top of the whole editor,
 // dimmed background (scrim) and a panel in the style of the DETECTED panel. No popup/window (WSLg).
-// Sections: APPEARANCE (theme), TOOLS (ToolManager), AUDIO (standalone only).
+// Sections: APPEARANCE (theme), TOOLS (ToolManager), STORAGE (cache + exports), AUDIO (standalone only).
 // When closed the component is invisible and intercepts nothing. Message thread only.
 class SettingsOverlay : public juce::Component,
                         private juce::ChangeListener
@@ -54,7 +55,54 @@ public:
             autoButton.setButtonText (autoText());
         };
 
-        openButton.onClick = [this] { openFolder(); };
+        openButton.onClick = [this] { openFolder (ToolManager::toolsDir(), localNote); };
+
+        // --- STORAGE ---
+        for (auto* b : { &cacheOpenButton, &cacheClearButton, &exportOpenButton })
+        {
+            b->getProperties().set ("outline", true);
+            addAndMakeVisible (*b);
+        }
+        cacheOpenButton.onClick  = [this] { openFolder (sg::storage::cacheRoot(), storageNote); };
+        exportOpenButton.onClick = [this] { openFolder (sg::storage::exportRoot(), storageNote); };
+        // Two-step confirm inside the button (no popup): first click arms for 3 s, second click clears
+        cacheClearButton.onClick = [this]
+        {
+            if (! clearArmed)
+            {
+                clearArmed = true;
+                cacheClearButton.setButtonText ("CONFIRM CLEAR?");
+                const int token = ++clearToken;
+                juce::Timer::callAfterDelay (3000, [safe = juce::Component::SafePointer<SettingsOverlay> (this), token]
+                {
+                    if (safe != nullptr && safe->clearToken == token)
+                        safe->disarmClear();
+                });
+                return;
+            }
+            disarmClear();
+            storageNote.clear();
+            cache->requestClearNow();
+            repaint();
+        };
+
+        for (auto* b : { &cleanOffButton, &clean7Button, &cleanMaxButton })
+        {
+            b->setClickingTogglesState (true);
+            b->setRadioGroupId (2002);
+            b->getProperties().set ("outline", true);
+            addAndMakeVisible (*b);
+        }
+        auto setClean = [this] (sg::storage::AutoClean m)
+        {
+            sg::storage::setAutoClean (m);
+            storageNote.clear();
+            if (m != sg::storage::AutoClean::off)
+                cache->requestAutoClean();   // a new limit applies right away
+        };
+        cleanOffButton.onClick = [setClean] { setClean (sg::storage::AutoClean::off); };
+        clean7Button.onClick   = [setClean] { setClean (sg::storage::AutoClean::days7); };
+        cleanMaxButton.onClick = [setClean] { setClean (sg::storage::AutoClean::maxSize); };
 
         audioButton.onClick = [this]
         {
@@ -63,11 +111,13 @@ public:
         };
 
         tools->addChangeListener (this);
+        cache->addChangeListener (this);
         themeChanged();
     }
 
     ~SettingsOverlay() override
     {
+        cache->removeChangeListener (this);
         tools->removeChangeListener (this);
     }
 
@@ -82,8 +132,14 @@ public:
         autoButton.setToggleState (ToolManager::isAutoUpdateYtDlp(), juce::dontSendNotification);
         autoButton.setButtonText (autoText());
         localNote.clear();
+        storageNote.clear();
+        disarmClear();
         tools->refresh();
         refreshTools();
+        const auto mode = sg::storage::getAutoClean();
+        (mode == sg::storage::AutoClean::off ? cleanOffButton : mode == sg::storage::AutoClean::days7 ? clean7Button : cleanMaxButton)
+            .setToggleState (true, juce::dontSendNotification);
+        cache->requestSize();   // background thread, result via change message
         resized();
     }
 
@@ -100,6 +156,7 @@ public:
         const int h = 16 + 24 + 12                         // top margin, title
                     + 16 + 6 + 22 + 20                     // APPEARANCE
                     + 16 + 6 + 3 * rowH + 8 + 22 + 6 + 16 + 8 + 22 + 20   // TOOLS
+                    + 16 + 6 + 3 * 22 + 2 * 6 + 20         // STORAGE
                     + (hasAudio ? 16 + 6 + 22 + 20 : 0)    // AUDIO
                     + 16 + 16;                             // licence note, bottom margin
         panelR = getLocalBounds().withSizeKeepingCentre (w, h);
@@ -132,6 +189,30 @@ public:
         r.removeFromTop (8);
         folderR = r.removeFromTop (22);
         openButton.setBounds (folderR.removeFromRight (64));
+        r.removeFromTop (20);
+
+        // STORAGE: [CACHE path size  OPEN CLEAR NOW] [AUTO-CLEAN OFF 7 DAYS 1 GB MAX  note] [EXPORTS path  OPEN]
+        storageLabelR = r.removeFromTop (16);
+        r.removeFromTop (6);
+        cacheR = r.removeFromTop (22);
+        cacheClearButton.setBounds (cacheR.removeFromRight (112));   // room for "CONFIRM CLEAR?"
+        cacheR.removeFromRight (4);
+        cacheOpenButton.setBounds (cacheR.removeFromRight (64));
+        cacheSizeR = cacheR.removeFromRight (84).withTrimmedRight (8);
+        r.removeFromTop (6);
+        cleanR = r.removeFromTop (22);
+        {
+            auto cr = cleanR.withTrimmedLeft (labelW);
+            cleanOffButton.setBounds (cr.removeFromLeft (48));
+            cr.removeFromLeft (4);
+            clean7Button.setBounds (cr.removeFromLeft (64));
+            cr.removeFromLeft (4);
+            cleanMaxButton.setBounds (cr.removeFromLeft (80));
+            cleanNoteR = cr.withTrimmedLeft (12);
+        }
+        r.removeFromTop (6);
+        exportR = r.removeFromTop (22);
+        exportOpenButton.setBounds (exportR.removeFromRight (64));
         r.removeFromTop (20);
 
         if (hasAudio)
@@ -169,6 +250,7 @@ public:
         g.setFont (ui::label (10.0f));
         g.drawText ("APPEARANCE", appLabelR, juce::Justification::centredLeft);
         g.drawText ("TOOLS", toolsLabelR, juce::Justification::centredLeft);
+        g.drawText ("STORAGE", storageLabelR, juce::Justification::centredLeft);
         if (hasAudio)
             g.drawText ("AUDIO", audioLabelR, juce::Justification::centredLeft);
 
@@ -177,11 +259,13 @@ public:
         // Folder
         g.setColour (ui::c().textSecondary);
         g.setFont (ui::label (10.0f));
-        g.drawText ("FOLDER", folderR.withWidth (56), juce::Justification::centredLeft);
+        g.drawText ("FOLDER", folderR.withWidth (labelW), juce::Justification::centredLeft);
         g.setColour (ui::c().textPrimary);
         g.setFont (ui::monoUi (11.0f));
-        g.drawFittedText (shortPath (ToolManager::toolsDir()), folderR.withTrimmedLeft (56).withTrimmedRight (8),
+        g.drawFittedText (shortPath (ToolManager::toolsDir()), folderR.withTrimmedLeft (labelW).withTrimmedRight (8),
                           juce::Justification::centredLeft, 1, 1.0f);
+
+        paintStorage (g);
 
         g.setColour (ui::c().textTertiary);
         g.setFont (ui::label (10.0f));
@@ -208,8 +292,23 @@ public:
 private:
     static constexpr int rowH = 24;
 
-    void changeListenerCallback (juce::ChangeBroadcaster*) override
+    static constexpr int labelW = 84;   // label column of the STORAGE rows
+
+    void disarmClear()
     {
+        clearArmed = false;
+        ++clearToken;
+        cacheClearButton.setButtonText ("CLEAR NOW");
+    }
+
+    void changeListenerCallback (juce::ChangeBroadcaster* source) override
+    {
+        if (source == &cache.get())
+        {
+            if (isVisible())
+                repaint();   // size or clean result
+            return;
+        }
         localNote.clear();   // a tool event replaces the local note (e.g. PATH COPIED)
         if (isVisible())
             refreshTools();
@@ -217,10 +316,9 @@ private:
 
     // Create the folder only on click, then open it in the file manager.
     // Linux: xdg-open as a separate process with an argument list (no shell); if missing (WSLg without desktop tools),
-    // copy the path to the clipboard and show that.
-    void openFolder()
+    // copy the path to the clipboard and show that (in the given note line).
+    void openFolder (const juce::File& dir, juce::String& note)
     {
-        const auto dir = ToolManager::toolsDir();
         dir.createDirectory();
 
        #if JUCE_LINUX
@@ -233,7 +331,37 @@ private:
             }
 
         bool started = false;
-        if (xdg != juce::File())
+
+        // WSL: no Linux file manager, but Windows Explorer can open the folder via its \\wsl.localhost\... path
+        if (juce::SystemStats::getEnvironmentVariable ("WSL_DISTRO_NAME", {}).isNotEmpty())
+        {
+            const juce::File wslpath ("/usr/bin/wslpath");
+            juce::File explorer;
+            for (auto d : juce::StringArray::fromTokens (juce::SystemStats::getEnvironmentVariable ("PATH", {}), ":", {}))
+                if (juce::File::isAbsolutePath (d) && juce::File (d).getChildFile ("explorer.exe").existsAsFile())
+                {
+                    explorer = juce::File (d).getChildFile ("explorer.exe");
+                    break;
+                }
+            if (explorer == juce::File())
+                explorer = juce::File ("/mnt/c/Windows/explorer.exe");
+
+            if (wslpath.existsAsFile() && explorer.existsAsFile())
+            {
+                juce::ChildProcess conv;
+                if (conv.start (juce::StringArray { wslpath.getFullPathName(), "-w", dir.getFullPathName() }))
+                {
+                    const auto winPath = conv.readAllProcessOutput().trim();
+                    if (winPath.isNotEmpty())
+                    {
+                        opener = std::make_unique<juce::ChildProcess>();
+                        started = opener->start (juce::StringArray { explorer.getFullPathName(), winPath }, 0);
+                    }
+                }
+            }
+        }
+
+        if (! started && xdg != juce::File())
         {
             opener = std::make_unique<juce::ChildProcess>();
             started = opener->start (juce::StringArray { xdg.getFullPathName(), dir.getFullPathName() }, 0);
@@ -241,7 +369,7 @@ private:
         if (! started)
         {
             juce::SystemClipboard::copyTextToClipboard (dir.getFullPathName());
-            localNote = "NO FILE MANAGER FOUND - PATH COPIED";
+            note = "NO FILE MANAGER FOUND - PATH COPIED";
             repaint();
         }
        #else
@@ -273,6 +401,43 @@ private:
             p = "~" + p.substring (home.length());
        #endif
         return p;
+    }
+
+    void paintStorage (juce::Graphics& g)
+    {
+        auto pathRow = [&] (const char* label, juce::Rectangle<int> row, const juce::File& dir)
+        {
+            g.setColour (ui::c().textSecondary);
+            g.setFont (ui::label (10.0f));
+            g.drawText (label, row.removeFromLeft (labelW), juce::Justification::centredLeft);
+            g.setColour (ui::c().textPrimary);
+            g.setFont (ui::monoUi (11.0f));
+            g.drawFittedText (shortPath (dir), row.withTrimmedRight (8), juce::Justification::centredLeft, 1, 1.0f);
+        };
+
+        pathRow ("CACHE", cacheR, sg::storage::cacheRoot());
+        pathRow ("EXPORTS", exportR, sg::storage::exportRoot());
+
+        const auto bytes = cache->getSize();
+        g.setColour (cache->isBusy() ? ui::c().textSecondary : ui::c().textPrimary);
+        g.setFont (ui::monoUi (11.0f));
+        g.drawText (cache->isBusy() || bytes < 0 ? juce::String ("...") : sg::storage::formatBytes (bytes),
+                    cacheSizeR, juce::Justification::centredRight);
+
+        g.setColour (ui::c().textSecondary);
+        g.setFont (ui::label (10.0f));
+        g.drawText ("AUTO-CLEAN", cleanR.withWidth (labelW), juce::Justification::centredLeft);
+
+        // Note: OPEN fallback, otherwise last clean result, otherwise what the mode does
+        juce::String note = storageNote;
+        if (note.isEmpty())
+            note = cache->getLastNote();
+        if (note.isEmpty())
+            note = cleanMaxButton.getToggleState() ? "OLDEST FIRST, LOADED FILES KEPT"
+                 : clean7Button.getToggleState()   ? "UNUSED FOR 7 DAYS, LOADED FILES KEPT"
+                                                   : "NOTHING IS DELETED AUTOMATICALLY";
+        g.setFont (ui::monoUi (10.0f));
+        g.drawFittedText (note, cleanNoteR, juce::Justification::centredLeft, 1, 1.0f);
     }
 
     void paintTools (juce::Graphics& g)
@@ -397,6 +562,7 @@ private:
 
     SampleGrabberProcessor& proc;
     juce::SharedResourcePointer<ToolManager> tools;
+    juce::SharedResourcePointer<CacheManager> cache;
 
     IconButton closeButton { IconButton::Icon::close };
     juce::TextButton darkButton { "DARK" }, classicButton { "CLASSIC" };
@@ -404,11 +570,17 @@ private:
     juce::TextButton autoButton { "AUTO-UPDATE YT-DLP: ON" };
     juce::TextButton openButton { "OPEN" };
     juce::TextButton audioButton { "AUDIO / MIDI SETUP" };
+    juce::TextButton cacheOpenButton { "OPEN" }, cacheClearButton { "CLEAR NOW" }, exportOpenButton { "OPEN" };
+    juce::TextButton cleanOffButton { "OFF" }, clean7Button { "7 DAYS" }, cleanMaxButton { "1 GB MAX" };
+    juce::String storageNote;                       // OPEN fallback note in the STORAGE section
+    bool clearArmed = false;                        // CLEAR NOW clicked once, waiting for the confirm click
+    int clearToken = 0;                             // invalidates pending disarm timers
 
     bool hasAudio = false;
     juce::String localNote;                         // note from the overlay itself (OPEN), until the next tool event
     std::unique_ptr<juce::ChildProcess> opener;     // xdg-open; object stays until the next click (no kill)
     juce::Rectangle<int> panelR, titleR, appLabelR, toolsLabelR, rowsR, toolStatusR, lastCheckR, folderR, audioLabelR, footerR;
+    juce::Rectangle<int> storageLabelR, cacheR, cacheSizeR, cleanR, cleanNoteR, exportR;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SettingsOverlay)
 };

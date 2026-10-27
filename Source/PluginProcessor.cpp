@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <cstdio>
+#include <cstring>
 
 #if __has_include(<signalsmith-stretch/signalsmith-stretch.h>)
  #include <signalsmith-stretch/signalsmith-stretch.h>
@@ -816,6 +817,538 @@ private:
 };
 
 //==============================================================================
+// Export (drag-out). Capture -> hash -> write; usable on the message thread and on the background worker.
+namespace
+{
+    constexpr juce::uint32 kExportFormatVersion = 1;    // bump when the export output changes (bit depth, click guard, ...)
+    constexpr int kExportChunk = 65536;                 // frames per write: bounded RAM independent of the region length
+    constexpr juce::int32 kEmbedMagic = 0x31414753;     // "SGA1": FLAC chunk appended after the XML state
+    constexpr double kMaxEmbedSeconds = 600.0;          // embed the selection only up to 10 minutes
+    constexpr size_t kMaxEmbedBytes = (size_t) 32 * 1024 * 1024;   // and only up to 32 MB of FLAC (project file size)
+    std::atomic<size_t> gEmbedCapBytes { kMaxEmbedBytes };          // self test lowers it
+
+    // Simple 64-bit mixing hash (not cryptographic; collisions only matter within one title folder)
+    struct Hasher
+    {
+        juce::uint64 h = 0xcbf29ce484222325ull;
+        void add (juce::uint64 v) noexcept
+        {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            h *= 0x100000001b3ull;
+        }
+        void addFloat (float f) noexcept   { juce::uint32 b; std::memcpy (&b, &f, sizeof (b)); add (b); }
+        void addDouble (double d) noexcept { juce::uint64 b; std::memcpy (&b, &d, sizeof (b)); add (b); }
+        void addString (const juce::String& s) noexcept { add ((juce::uint64) s.hashCode64()); }
+        juce::uint64 result() const noexcept
+        {
+            auto z = h + 0x9e3779b97f4a7c15ull;   // splitmix64 finaliser
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+            return z ^ (z >> 31);
+        }
+    };
+
+    void logLine (const juce::String& s)
+    {
+        if (kDebugDump)
+            std::fprintf (stderr, "[SG] %s\n", s.toRawUTF8());
+    }
+}
+
+bool SampleGrabberProcessor::captureExportJob (int pad, ExportJob& job) const
+{
+    std::shared_ptr<juce::AudioBuffer<float>> buf;
+    std::shared_ptr<RenderedAudio> rnd;
+    std::array<int, numPads + 1> bounds {};
+    {
+        const juce::SpinLock::ScopedLockType sl (lock);
+        buf = sample;
+        rnd = rendered;
+        bounds = sliceBounds;
+    }
+    if (buf == nullptr)
+        return false;
+
+    const int len = buf->getNumSamples();
+    job.whole = (pad < 0 || pad >= numPads);
+    job.pad = job.whole ? numPads : pad;
+    job.srcStart = juce::jlimit (0, len - 1, job.whole ? bounds.front() : bounds[(size_t) pad]);
+    job.srcEnd   = juce::jlimit (0, len,     job.whole ? bounds.back()  : bounds[(size_t) pad + 1]);
+    job.selStart = juce::jlimit (0, len - 1, bounds.front());
+    job.selEnd   = juce::jlimit (0, len,     bounds.back());
+    if (job.srcEnd - job.srcStart < 2 || job.selEnd - job.selStart < 2)
+        return false;
+
+    job.rate = fileRate.load();
+    job.pitch = pitchParam->load();
+    job.speed = (double) speedParam->load() / 100.0;
+    const bool neutral = std::abs (job.pitch) < 0.005f && std::abs (job.speed - 1.0) < 0.0005;
+    job.stretched = ! neutral && job.selEnd - job.selStart >= 2048;   // shorter selections play the original (as the renderer)
+    if (job.stretched)
+    {
+        // Only a render made with exactly these settings; an older one (pitch changed, renderer not done yet) would bake stale audio
+        if (rnd != nullptr && rnd->regionStart == job.selStart && rnd->regionEnd == job.selEnd
+            && std::abs (rnd->speed - job.speed) < 1.0e-9 && std::abs (rnd->pitch - job.pitch) < 1.0e-6f)
+            job.rnd = rnd;
+        else
+            job.needsRender = true;
+    }
+
+    job.buf = std::move (buf);
+    job.gainDb = gainParam->load();
+    job.fadeInPct = fadeInParam->load();
+    job.fadeOutPct = fadeOutParam->load();
+    job.fadeShape = fadeShapeParam->load();
+    {
+        const juce::ScopedLock ml (metaLock);
+        job.title = metaTitle.isNotEmpty() ? metaTitle : juce::String ("Untitled");
+    }
+    return true;
+}
+
+juce::uint64 SampleGrabberProcessor::hashExportJob (const ExportJob& job)
+{
+    // Content address: the audio that feeds the output + every parameter that changes it. Same hash = same file.
+    Hasher hs;
+    hs.add (kExportFormatVersion);
+    hs.addDouble (job.rate);
+    hs.add ((juce::uint64) job.buf->getNumChannels());
+    hs.addFloat (job.gainDb);
+    hs.addFloat (job.fadeInPct);
+    hs.addFloat (job.fadeOutPct);
+    hs.addFloat (job.fadeShape);
+
+    int a = job.srcStart, b = job.srcEnd;
+    if (job.stretched)
+    {
+        // The stretched render depends on the whole selection, the pad is a range inside it
+        hs.add (1);
+        hs.addFloat (job.pitch);
+        hs.addDouble (job.speed);
+        hs.add ((juce::uint64) (job.srcStart - job.selStart));
+        hs.add ((juce::uint64) (job.srcEnd - job.selStart));
+        a = job.selStart;
+        b = job.selEnd;
+    }
+    else
+    {
+        hs.add (0);
+    }
+
+    hs.add ((juce::uint64) (b - a));
+    for (int ch = 0; ch < job.buf->getNumChannels(); ++ch)
+    {
+        const float* d = job.buf->getReadPointer (ch);
+        for (int i = a; i < b; ++i)
+        {
+            juce::uint32 bits;
+            std::memcpy (&bits, d + i, sizeof (bits));
+            hs.add (bits);
+        }
+    }
+    return hs.result();
+}
+
+juce::String SampleGrabberProcessor::exportFileName (const ExportJob& job, juce::uint64 hash)
+{
+    const auto tag = job.whole ? juce::String ("sel") : "pad" + juce::String (job.pad + 1).paddedLeft ('0', 2);
+    const auto hex = juce::String::toHexString ((juce::uint32) (hash >> 32)).paddedLeft ('0', 8);
+    return job.title.substring (0, 40) + "_" + tag + "_" + hex + ".wav";
+}
+
+bool SampleGrabberProcessor::writeExport (const ExportJob& job, const juce::File& target, const std::function<bool()>& shouldAbort)
+{
+    // Pitch/speed: use the matching render, otherwise compute it now (worker thread or drag fallback)
+    std::shared_ptr<RenderedAudio> r = job.rnd;
+    if (job.stretched && r == nullptr)
+    {
+        r = renderStretched (*job.buf, job.selStart, job.selEnd, job.rate, job.pitch, job.speed, shouldAbort);
+        if (r == nullptr)
+            return false;
+    }
+
+    const juce::AudioBuffer<float>& src = r != nullptr ? r->buffer : *job.buf;
+    int s = job.srcStart, e = job.srcEnd;
+    if (r != nullptr)
+    {
+        const int rl = r->buffer.getNumSamples();
+        auto mapPos = [&] (int p) { return juce::jlimit (0, rl, (int) std::lround ((double) (p - r->regionStart) / r->speed)); };
+        s = mapPos (job.srcStart);
+        e = mapPos (job.srcEnd);
+    }
+    if (e - s < 2)
+        return false;
+
+    const float gain = gainFromDb (job.gainDb);   // constant (no smoothing), silent at the left stop
+    // Same envelope as in processBlock (same region in source or render space)
+    const double fadeInFrac  = (double) job.fadeInPct  * 0.01;
+    const double fadeOutFrac = (double) job.fadeOutPct * 0.01;
+    const double fadeExp     = fadeExponent ((double) job.fadeShape);
+    const double clickS      = clickGuardSeconds * job.rate;   // export: click guard at both ends
+
+    if (! target.getParentDirectory().createDirectory())
+        return false;
+
+    // Write next to the target under a unique temp name, rename when complete: the target appears whole or not at all
+    const auto tmp = target.getSiblingFile (target.getFileName() + "."
+                                            + juce::String::toHexString (juce::Random::getSystemRandom().nextInt()) + ".tmp");
+    std::unique_ptr<juce::FileOutputStream> os (tmp.createOutputStream());
+    if (os == nullptr)
+        return false;
+
+    const int numCh = src.getNumChannels();
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatWriter> writer (wav.createWriterFor (os.get(), job.rate, (unsigned int) numCh, 24, {}, 0));
+    if (writer == nullptr)
+    {
+        os.reset();
+        tmp.deleteFile();
+        return false;
+    }
+    os.release();   // the writer now owns the stream
+
+    const int total = e - s;
+    juce::AudioBuffer<float> chunk (numCh, juce::jmin (kExportChunk, total));
+    bool ok = true;
+    for (int pos = 0; pos < total && ok; pos += kExportChunk)
+    {
+        if (shouldAbort && shouldAbort())
+        {
+            ok = false;
+            break;
+        }
+        const int n = juce::jmin (kExportChunk, total - pos);
+        for (int i = 0; i < n; ++i)
+        {
+            const double p = (double) (s + pos + i);
+            const float env = fadeEnvelope (p, (double) s, (double) e, fadeInFrac, fadeOutFrac, fadeExp, clickS, clickS) * gain;
+            for (int ch = 0; ch < numCh; ++ch)
+                chunk.setSample (ch, i, src.getSample (ch, s + pos + i) * env);
+        }
+        ok = writer->writeFromAudioSampleBuffer (chunk, 0, n);
+    }
+    writer.reset();   // finishes the header, closes the file
+
+    if (ok && target.existsAsFile())
+    {
+        tmp.deleteFile();   // same content-addressed file appeared meanwhile (other instance): never replace it
+        return true;
+    }
+    if (! ok || ! tmp.moveFileTo (target))
+    {
+        tmp.deleteFile();
+        return false;
+    }
+    return true;
+}
+
+juce::uint64 SampleGrabberProcessor::computeStageKey() const
+{
+    std::array<int, numPads + 1> bounds {};
+    bool has = false;
+    {
+        const juce::SpinLock::ScopedLockType sl (lock);
+        has = sample != nullptr;
+        bounds = sliceBounds;
+    }
+    if (! has)
+        return 0;
+
+    Hasher hs;
+    hs.add ((juce::uint64) sampleSerial.load());
+    for (int b : bounds)
+        hs.add ((juce::uint64) (juce::uint32) b);
+    hs.addDouble (fileRate.load());
+    hs.addFloat (pitchParam->load());
+    hs.addFloat (speedParam->load());
+    hs.addFloat (gainParam->load());
+    hs.addFloat (fadeInParam->load());
+    hs.addFloat (fadeOutParam->load());
+    hs.addFloat (fadeShapeParam->load());
+    {
+        const juce::ScopedLock ml (metaLock);
+        hs.addString (metaTitle);
+    }
+    const auto k = hs.result();
+    return k == 0 ? 1 : k;
+}
+
+juce::uint64 SampleGrabberProcessor::computeEmbedKey() const
+{
+    const int len = getNumSamples();
+    if (len <= 0)
+        return 0;
+    const auto reg = getRegion (len);
+    Hasher hs;
+    hs.add ((juce::uint64) sampleSerial.load());
+    hs.add ((juce::uint64) reg.first);
+    hs.add ((juce::uint64) reg.second);
+    const auto k = hs.result();
+    return k == 0 ? 1 : k;
+}
+
+//==============================================================================
+// Background worker (never the audio or message thread), debounced 300 ms after a change:
+//  1. FLAC of the current selection for the plugin state (getStateInformation only copies the cached block)
+//  2. Staging: renders the 16 pads + the selection into cache/staging/inst-<id>/ so a drag only needs a hard link/copy.
+// One item at a time, written in chunks -> RAM stays bounded (plus the render buffer the renderer already holds).
+class SampleGrabberProcessor::BackgroundWorker : public juce::Thread
+{
+public:
+    static constexpr juce::uint32 debounceMs = 300;
+    static constexpr double maxStageSeconds = 120.0;   // longer items are rendered on drag (disk churn on every knob move otherwise)
+
+    explicit BackgroundWorker (SampleGrabberProcessor& p)
+        : juce::Thread ("sg-background"), owner (p),
+          stagingDir (sg::storage::cacheRoot().getChildFile ("staging")
+                          .getChildFile ("inst-" + juce::String::toHexString (juce::Random::getSystemRandom().nextInt64())))
+    {
+    }
+
+    ~BackgroundWorker() override
+    {
+        stopThread (15000);
+        stagingDir.deleteRecursively();   // staged files are regenerable; exports in the export folder are separate files/links
+    }
+
+    juce::File getStagingDir() const { return stagingDir; }
+
+    juce::String lookup (int item, juce::uint64 key) const
+    {
+        const juce::ScopedLock sl (stageLock);
+        if (key == 0 || key != publishedKey.load() || item < 0 || item > numPads)
+            return {};
+        return names[(size_t) item];
+    }
+
+    bool isIdle() const
+    {
+        const auto sk = owner.computeStageKey();
+        const auto ek = owner.computeEmbedKey();
+        return ek == owner.embeddedDoneKey.load() && ! owner.isRendering()
+               && (sk == 0 || sk == publishedKey.load() || sk == failedKey.load());
+    }
+
+    void run() override
+    {
+        juce::uint64 seenStage = 0, seenEmbed = 0;
+        juce::uint32 stageChanged = 0, embedChanged = 0, lastVerify = 0;
+
+        while (! threadShouldExit())
+        {
+            wait (100);
+            const auto now = juce::Time::getMillisecondCounter();
+
+            const auto ek = owner.computeEmbedKey();
+            if (ek != seenEmbed) { seenEmbed = ek; embedChanged = now; }
+            if (ek != owner.embeddedDoneKey.load() && now - embedChanged >= debounceMs)
+                encodeEmbedded (ek);
+
+            if (threadShouldExit())
+                break;
+
+            const auto sk = owner.computeStageKey();
+            if (sk != seenStage) { seenStage = sk; stageChanged = now; }
+            if (sk != 0 && sk != publishedKey.load() && sk != failedKey.load() && now - stageChanged >= debounceMs)
+            {
+                stageAll (sk);
+            }
+            else if (sk != 0 && sk == publishedKey.load() && now - lastVerify > 2000)
+            {
+                // CLEAR NOW / auto-clean may have removed staged files: stage again
+                lastVerify = now;
+                bool missing = false;
+                {
+                    const juce::ScopedLock sl (stageLock);
+                    for (const auto& n : names)
+                        if (n.isNotEmpty() && ! stagingDir.getChildFile (n).existsAsFile())
+                            missing = true;
+                }
+                if (missing)
+                    publishedKey = 0;
+            }
+        }
+    }
+
+private:
+    void encodeEmbedded (juce::uint64 key)
+    {
+        auto buf = owner.getSnapshot();
+        auto publish = [&] (std::shared_ptr<const juce::MemoryBlock> block, int serial, float ts, float te)
+        {
+            {
+                const juce::ScopedLock ml (owner.metaLock);
+                std::swap (owner.embeddedFlac, block);   // old block is released below, outside the lock
+                owner.embeddedFlacKey = key;
+                owner.embeddedFlacSerial = serial;
+                owner.embeddedFlacTrimStart = ts;
+                owner.embeddedFlacTrimEnd = te;
+            }
+            owner.embeddedDoneKey = key;
+        };
+
+        if (buf == nullptr || key == 0)
+        {
+            owner.embeddedDoneKey = key;
+            return;
+        }
+
+        const int serial = owner.sampleSerial.load();
+        const int len = buf->getNumSamples();
+        const auto reg = owner.getRegion (len);
+        const double rate = owner.fileRate.load();
+        const int numCh = buf->getNumChannels();
+        if (owner.computeEmbedKey() != key)
+            return;   // changed while reading: next cycle
+
+        // Validate before touching the encoder (libFLAC: 1..655350 Hz; we only ever load 1-2 channels)
+        if (reg.second - reg.first < 2 || ! std::isfinite (rate) || rate < 1.0 || rate > 655350.0 || numCh < 1 || numCh > 2)
+        {
+            publish (nullptr, -1, 0.0f, 1.0f);
+            return;
+        }
+
+        auto tooBig = [&] (const juce::String& why)
+        {
+            logLine ("state: " + why + " - audio not embedded, path and link are saved");
+            publish (nullptr, -1, 0.0f, 1.0f);
+            if (owner.embedWarnSerial.exchange (serial) != serial)
+                ++owner.embedWarnVersion;   // editor shows the note once per sample
+        };
+
+        if ((double) (reg.second - reg.first) > kMaxEmbedSeconds * rate)
+        {
+            tooBig ("selection longer than 10 min");
+            return;
+        }
+
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        juce::MemoryBlock mb;
+        {
+            // Ownership (JUCE 8, juce_FlacAudioFormat.cpp createWriterFor/~FlacWriter): on failure createWriterFor returns
+            // nullptr and does NOT delete the stream (mos still owns it); on success the writer deletes it -> release here.
+            // mb is declared outside this scope, so the writer (finishing into mos) is always destroyed before mb.
+            auto mos = std::make_unique<juce::MemoryOutputStream> (mb, false);
+            juce::FlacAudioFormat flac;
+            const int bits = owner.fileBitDepth.load() > 16 ? 24 : 16;
+            std::unique_ptr<juce::AudioFormatWriter> w (flac.createWriterFor (mos.get(), rate, (unsigned int) numCh, bits, {}, 5));
+            if (w == nullptr)
+            {
+                logLine ("state: FLAC encoder refused " + juce::String (rate) + " Hz - audio not embedded");
+                publish (nullptr, -1, 0.0f, 1.0f);
+                return;
+            }
+            mos.release();
+
+            for (int pos = reg.first; pos < reg.second; pos += kExportChunk)
+            {
+                if (threadShouldExit() || owner.computeEmbedKey() != key)
+                    return;   // superseded; w and the partial block are dropped
+                if (! w->writeFromAudioSampleBuffer (*buf, pos, juce::jmin (kExportChunk, reg.second - pos)))
+                {
+                    logLine ("state: FLAC encoding failed - audio not embedded");
+                    publish (nullptr, -1, 0.0f, 1.0f);
+                    return;
+                }
+            }
+        }   // writer finishes the stream, MemoryOutputStream trims the block
+
+        const auto size = mb.getSize();
+        if (size > gEmbedCapBytes.load())
+        {
+            tooBig ("FLAC of the selection is " + sg::storage::formatBytes ((juce::int64) size) + " (limit "
+                    + sg::storage::formatBytes ((juce::int64) gEmbedCapBytes.load()) + ")");
+            return;
+        }
+        publish (std::make_shared<const juce::MemoryBlock> (std::move (mb)), serial, (float) reg.first / (float) len, (float) reg.second / (float) len);
+        logLine ("state: selection encoded as FLAC, " + juce::String ((double) (reg.second - reg.first) / rate, 1) + " s -> "
+                 + sg::storage::formatBytes ((juce::int64) size) + " in "
+                 + juce::String ((int) std::lround (juce::Time::getMillisecondCounterHiRes() - t0)) + " ms");
+    }
+
+    void stageAll (juce::uint64 key)
+    {
+        // Pitch/speed render still running: wait, otherwise the worker would compute the same stretch a second time
+        if (owner.isRendering())
+            return;
+
+        auto superseded = [this, key] { return threadShouldExit() || owner.computeStageKey() != key; };
+        std::array<juce::String, numPads + 1> newNames;
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        int written = 0;
+        std::shared_ptr<RenderedAudio> runRender;   // one stretch per run, shared by all 17 items (same selection/pitch/speed)
+
+        for (int item = 0; item <= numPads; ++item)
+        {
+            if (superseded())
+                return;
+
+            ExportJob job;
+            if (! owner.captureExportJob (item, job))
+                continue;   // empty pad
+            if (job.outputSeconds() > maxStageSeconds)
+                continue;   // long item: rendered on drag
+
+            const auto name = exportFileName (job, hashExportJob (job));
+            const auto f = stagingDir.getChildFile (name);
+            if (! f.existsAsFile())
+            {
+                if (job.needsRender)
+                {
+                    if (runRender == nullptr)
+                        runRender = renderStretched (*job.buf, job.selStart, job.selEnd, job.rate, job.pitch, job.speed, superseded);
+                    if (runRender == nullptr)
+                    {
+                        if (! superseded())
+                            failedKey = key;
+                        return;
+                    }
+                    job.rnd = runRender;
+                    job.needsRender = false;
+                }
+
+                stagingDir.createDirectory();   // cleaning may have removed the empty folder
+                if (! writeExport (job, f, superseded))
+                {
+                    if (superseded())
+                        return;
+                    logLine ("staging: could not write " + f.getFullPathName() + " - drag will render synchronously");
+                    failedKey = key;   // no retry loop on a full/readonly disk; next change tries again
+                    return;
+                }
+                ++written;
+            }
+            newNames[(size_t) item] = name;
+        }
+
+        if (superseded())
+            return;
+
+        {
+            const juce::ScopedLock sl (stageLock);
+            names = newNames;
+            publishedKey = key;
+        }
+
+        // Keep only the current set (at most 17 files per instance)
+        for (const auto& f : stagingDir.findChildFiles (juce::File::findFiles, false, "*", juce::File::FollowSymlinks::no))
+            if (std::find (newNames.begin(), newNames.end(), f.getFileName()) == newNames.end()
+                && ! f.getFileName().endsWith (".tmp"))
+                f.deleteFile();
+
+        if (written > 0)
+            logLine ("staging: " + juce::String (written) + " files rendered in "
+                     + juce::String ((int) std::lround (juce::Time::getMillisecondCounterHiRes() - t0)) + " ms -> " + stagingDir.getFullPathName());
+    }
+
+    SampleGrabberProcessor& owner;
+    const juce::File stagingDir;
+    mutable juce::CriticalSection stageLock;
+    std::array<juce::String, numPads + 1> names;
+    std::atomic<juce::uint64> publishedKey { 0 }, failedKey { 0 };
+};
+
+//==============================================================================
 std::shared_ptr<SampleGrabberProcessor::RenderedAudio>
 SampleGrabberProcessor::renderStretched (const juce::AudioBuffer<float>& src, int a, int b, double sr,
                                          float pitchSemitones, double speed,
@@ -890,6 +1423,7 @@ SampleGrabberProcessor::renderStretched (const juce::AudioBuffer<float>& src, in
     r->regionStart = a;
     r->regionEnd = b;
     r->speed = speed;
+    r->pitch = pitchSemitones;
     return r;
 }
 
@@ -976,15 +1510,22 @@ SampleGrabberProcessor::SampleGrabberProcessor()
     renderer = std::make_unique<Renderer> (*this);
     renderer->startThread();
 
+    worker = std::make_unique<BackgroundWorker> (*this);
+    worker->startThread (juce::Thread::Priority::low);
+
     graveyardTimer.startTimer (1000);   // empty the graveyard once per second on the message thread
+
+    cache->requestStartup();   // once per process: migrate old folders + auto-clean (background thread)
 }
 
 SampleGrabberProcessor::~SampleGrabberProcessor()
 {
+    worker.reset();   // stops the thread, removes this instance's staging folder
     apvts.removeParameterListener ("pitch", this);
     apvts.removeParameterListener ("speed", this);
     graveyardTimer.stopTimer();
     renderer->stopThread (5000);
+    sg::storage::setInUse (this, {});
 }
 
 void SampleGrabberProcessor::prepareToPlay (double sampleRate, int)
@@ -1208,6 +1749,13 @@ void SampleGrabberProcessor::pushHistory()
     e.sample = cur;
     e.flux = fluxCache;
     e.file = loadedFile;
+    {
+        const juce::ScopedLock ml (metaLock);
+        e.url = metaUrl;
+        e.embedded = embeddedMode;
+        e.embTrimStart = embOrigTrimStart;
+        e.embTrimEnd = embOrigTrimEnd;
+    }
     e.sampleRate = fileRate.load();
     e.bitDepth = fileBitDepth.load();
     e.trimStart = trimStart.load();
@@ -1258,8 +1806,34 @@ void SampleGrabberProcessor::installSample (std::shared_ptr<juce::AudioBuffer<fl
     ++sliceVersion;
     ++selectionVersion;
     ++renderVersion;
+    ++sampleSerial;
     loadedFile = file;
     markRenderDirty();
+    updateInUse();
+}
+
+void SampleGrabberProcessor::setMeta (const juce::File& file, const juce::String& url, bool embedded, float embTrimStart, float embTrimEnd)
+{
+    const auto title = sg::storage::titleFromFile (file);
+    const juce::ScopedLock ml (metaLock);
+    metaPath = file.getFullPathName();
+    metaTitle = title;
+    metaUrl = url;
+    embeddedMode = embedded;
+    embOrigTrimStart = embTrimStart;
+    embOrigTrimEnd = embTrimEnd;
+    restoreNote.clear();
+}
+
+void SampleGrabberProcessor::updateInUse()
+{
+    juce::StringArray paths;
+    if (loadedFile != juce::File())
+        paths.add (loadedFile.getFullPathName());
+    for (const auto& h : history)
+        if (h.file != juce::File())
+            paths.addIfNotAlreadyThere (h.file.getFullPathName());
+    sg::storage::setInUse (this, paths);
 }
 
 bool SampleGrabberProcessor::goBack()
@@ -1282,14 +1856,28 @@ bool SampleGrabberProcessor::goBack()
     keyValue = e.key;
     keyConfidence = e.keyConfidence;
 
+    setMeta (e.file, e.url, e.embedded, e.embTrimStart, e.embTrimEnd);
     installSample (std::move (e.sample), e.file, true);
     return true;
 }
 
-bool SampleGrabberProcessor::loadSample (const juce::File& file, bool recordHistory)
+bool SampleGrabberProcessor::loadSample (const juce::File& file, bool recordHistory, const juce::String& sourceUrl)
 {
     std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (file));
-    if (reader == nullptr || reader->lengthInSamples <= 0
+    if (reader == nullptr || ! installFromReader (*reader, file, recordHistory, sourceUrl))
+        return false;
+
+    // Cache files: mtime = last use, so auto-clean (7 DAYS / 1 GB MAX oldest first) removes the least recently used
+    if (sg::storage::isInsideCache (file))
+        file.setLastModificationTime (juce::Time::getCurrentTime());
+    return true;
+}
+
+bool SampleGrabberProcessor::installFromReader (juce::AudioFormatReader& readerRef, const juce::File& file, bool recordHistory,
+                                                const juce::String& url, bool embedded, float embTrimStart, float embTrimEnd)
+{
+    auto* reader = &readerRef;
+    if (reader->lengthInSamples <= 0 || reader->numChannels == 0
         || reader->lengthInSamples > (juce::int64) (std::numeric_limits<int>::max() / 2))
         return false;
 
@@ -1311,6 +1899,7 @@ bool SampleGrabberProcessor::loadSample (const juce::File& file, bool recordHist
     bpmOctave.store (0);   // new file: reset tempo octave
     bpmValue = 0.0f;       // old tempo does not apply to the new file (BEAT grid needs the new tempo)
 
+    setMeta (file, url, embedded, embTrimStart, embTrimEnd);
     installSample (std::move (fresh), file, true);
     return true;
 }
@@ -1868,136 +2457,431 @@ void SampleGrabberProcessor::processBlock (juce::AudioBuffer<float>& buffer, juc
     }
 }
 
-//==============================================================================
-juce::File SampleGrabberProcessor::exportRegion (int pad)
+
+juce::File SampleGrabberProcessor::prepareDragFile (int pad)
 {
-    std::shared_ptr<juce::AudioBuffer<float>> buf;
-    std::shared_ptr<RenderedAudio> rnd;
-    std::array<int, numPads + 1> bounds {};
-    {
-        const juce::SpinLock::ScopedLockType sl (lock);
-        buf = sample;
-        rnd = rendered;
-        bounds = sliceBounds;
-    }
-    if (buf == nullptr)
+    const int item = (pad < 0 || pad >= numPads) ? numPads : pad;
+    const auto label = item == numPads ? juce::String ("selection") : "pad " + juce::String (item + 1);
+    const auto key = computeStageKey();
+    if (key == 0)
         return {};
 
-    const int len = buf->getNumSamples();
-    const bool whole = (pad < 0 || pad >= numPads);
-    const int srcStart = juce::jlimit (0, len - 1, whole ? bounds.front() : bounds[(size_t) pad]);
-    const int srcEnd   = juce::jlimit (0, len,     whole ? bounds.back()  : bounds[(size_t) pad + 1]);
-    if (srcEnd - srcStart < 2)
-        return {};
-
-    const double fr = fileRate.load();
-    const float pitch = pitchParam->load();
-    const double speed = (double) speedParam->load() / 100.0;
-    const bool neutral = std::abs (pitch) < 0.005f && std::abs (speed - 1.0) < 0.0005;
-
-    // Pitch/speed: use the existing render, otherwise compute synchronously now
-    std::shared_ptr<RenderedAudio> r;
-    if (! neutral)
+    juce::String title;
     {
-        if (rnd != nullptr && rnd->regionStart == bounds.front() && rnd->regionEnd == bounds.back())
-            r = rnd;
-        else if (bounds.back() - bounds.front() >= 2048)
-            r = renderStretched (*buf, bounds.front(), bounds.back(), fr, pitch, speed, {});
+        const juce::ScopedLock ml (metaLock);
+        title = metaTitle.isNotEmpty() ? metaTitle : juce::String ("Untitled");
     }
+    const auto dir = sg::storage::exportRoot().getChildFile (title);
+    sg::storage::removeStaleTemps (dir, 60 * 60 * 1000);   // interrupted exports of ours, older than 1 h
+    const auto t0 = juce::Time::getMillisecondCounterHiRes();
+    auto ms = [t0] { return juce::String ((int) std::lround (juce::Time::getMillisecondCounterHiRes() - t0)) + " ms"; };
 
-    const juce::AudioBuffer<float>& src = r != nullptr ? r->buffer : *buf;
-    int s = srcStart, e = srcEnd;
-    if (r != nullptr)
+    // Fast path: the worker has staged exactly this state
+    const auto staged = worker != nullptr ? worker->lookup (item, key) : juce::String();
+    if (staged.isNotEmpty())
     {
-        const int rl = r->buffer.getNumSamples();
-        auto mapPos = [&] (int p) { return juce::jlimit (0, rl, (int) std::lround ((double) (p - r->regionStart) / r->speed)); };
-        s = mapPos (srcStart);
-        e = mapPos (srcEnd);
-    }
-    if (e - s < 2)
-        return {};
-
-    const float gain = gainFromDb (gainParam->load());   // constant (no smoothing), silent at the left stop
-    // Same envelope as in processBlock (same region in source or render space)
-    const double fadeInFrac  = (double) fadeInParam->load()  * 0.01;
-    const double fadeOutFrac = (double) fadeOutParam->load() * 0.01;
-    const double fadeExp     = fadeExponent ((double) fadeShapeParam->load());
-    const double clickS      = clickGuardSeconds * fr;   // export: click guard at both ends
-
-    juce::AudioBuffer<float> out (src.getNumChannels(), e - s);
-    for (int i = 0; i < e - s; ++i)
-    {
-        const float env = fadeEnvelope ((double) (s + i), (double) s, (double) e, fadeInFrac, fadeOutFrac, fadeExp, clickS, clickS) * gain;
-        for (int ch = 0; ch < out.getNumChannels(); ++ch)
-            out.setSample (ch, i, src.getSample (ch, s + i) * env);
+        const auto target = dir.getChildFile (staged);
+        if (target.existsAsFile())
+        {
+            logLine ("drag: " + label + " reuses " + target.getFullPathName());
+            return target;
+        }
+        if (sg::storage::copyIfAbsent (worker->getStagingDir().getChildFile (staged), target))
+        {
+            logLine ("drag: " + label + " from staging (" + ms() + ") -> " + target.getFullPathName());
+            return target;
+        }
     }
 
-    auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory)
-                   .getChildFile ("SampleGrabber").getChildFile ("export");
-    dir.createDirectory();
-
-    const auto base = loadedFile.getFileNameWithoutExtension().substring (0, 40);
-    const auto name = base + (whole ? juce::String ("_sel") : "_pad" + juce::String (pad + 1).paddedLeft ('0', 2)) + ".wav";
-    auto file = dir.getChildFile (name);
-    file.deleteFile();
-
-    std::unique_ptr<juce::FileOutputStream> os (file.createOutputStream());
-    if (os == nullptr)
+    // Fallback: not staged yet (changed < 300 ms ago, long item, staged file cleaned) -> render now so the drag never fails
+    ExportJob job;
+    if (! captureExportJob (item, job))
         return {};
-
-    juce::WavAudioFormat wav;
-    std::unique_ptr<juce::AudioFormatWriter> writer (
-        wav.createWriterFor (os.get(), fr, (unsigned int) out.getNumChannels(), 24, {}, 0));
-    if (writer == nullptr)
+    const auto target = dir.getChildFile (exportFileName (job, hashExportJob (job)));
+    if (target.existsAsFile())
+    {
+        logLine ("drag: " + label + " reuses " + target.getFullPathName() + " (" + ms() + ")");
+        return target;
+    }
+    if (! writeExport (job, target, {}))
+    {
+        logLine ("drag: " + label + " export FAILED -> " + target.getFullPathName());
         return {};
+    }
+    logLine ("drag: " + label + " not staged yet - rendered synchronously (" + ms() + ") -> " + target.getFullPathName());
+    return target;
+}
 
-    os.release();   // the writer now owns the stream
-    writer->writeFromAudioSampleBuffer (out, 0, out.getNumSamples());
-    writer.reset();
+void SampleGrabberProcessor::setEmbedCapForTest (size_t bytes)
+{
+    gEmbedCapBytes = bytes;
+}
 
-    return file;
+bool SampleGrabberProcessor::isStagedReady (int pad) const
+{
+    const int item = (pad < 0 || pad >= numPads) ? numPads : pad;
+    return worker != nullptr && worker->lookup (item, computeStageKey()).isNotEmpty();
+}
+
+bool SampleGrabberProcessor::waitForBackgroundIdle (int timeoutMs)
+{
+    const auto end = juce::Time::getMillisecondCounter() + (juce::uint32) timeoutMs;
+    juce::Thread::sleep (BackgroundWorker::debounceMs + 150);   // let the debounce see the last change first
+    while (juce::Time::getMillisecondCounter() < end)
+    {
+        if (worker == nullptr || worker->isIdle())
+            return true;
+        juce::Thread::sleep (20);
+    }
+    return false;
+}
+
+size_t SampleGrabberProcessor::getEmbeddedAudioBytes() const
+{
+    const juce::ScopedLock ml (metaLock);
+    return embeddedFlac != nullptr && embeddedFlacSerial == sampleSerial.load() ? embeddedFlac->getSize() : 0;
+}
+
+juce::String SampleGrabberProcessor::getRestoreNote() const
+{
+    const juce::ScopedLock ml (metaLock);
+    return restoreNote;
+}
+
+juce::String SampleGrabberProcessor::getSourceUrl() const
+{
+    const juce::ScopedLock ml (metaLock);
+    return metaUrl;
+}
+
+void SampleGrabberProcessor::seedEmbedded (std::shared_ptr<const juce::MemoryBlock> flac)
+{
+    const auto key = computeEmbedKey();
+    const auto len = getNumSamples();
+    const auto reg = getRegion (juce::jmax (1, len));
+    {
+        const juce::ScopedLock ml (metaLock);
+        std::swap (embeddedFlac, flac);
+        embeddedFlacKey = key;
+        embeddedFlacSerial = sampleSerial.load();
+        embeddedFlacTrimStart = len > 0 ? (float) reg.first / (float) len : 0.0f;
+        embeddedFlacTrimEnd = len > 0 ? (float) reg.second / (float) len : 1.0f;
+    }
+    embeddedDoneKey = key;   // the worker does not encode the same audio again
 }
 
 //==============================================================================
+// Plugin state: XML (parameters, source path/URL, trim, slice mode, tempo) + optionally the FLAC of the selection,
+// appended after the XML block: [JUCE xml binary][int32 "SGA1"][int64 size][FLAC bytes]. JUCE's getXmlFromBinary ignores
+// trailing data, so older builds still read the XML part. Can be called from any thread: only atomics, metaLock, APVTS.
 void SampleGrabberProcessor::getStateInformation (juce::MemoryBlock& dest)
 {
     auto state = apvts.copyState();
-    state.setProperty ("samplePath", loadedFile.getFullPathName(), nullptr);
-    state.setProperty ("trimStart", (double) trimStart.load(), nullptr);
-    state.setProperty ("trimEnd", (double) trimEnd.load(), nullptr);
-    state.setProperty ("sliceMode", sliceMode.load(), nullptr);
+
+    juce::String path, url;
+    bool emb = false;
+    float eS = 0.0f, eE = 1.0f, flacTS = 0.0f, flacTE = 1.0f;
+    std::shared_ptr<const juce::MemoryBlock> flac;
+    std::shared_ptr<const RestoreInfo> pending;
+    int flacSerial = -1;
+    {
+        const juce::ScopedLock ml (metaLock);
+        pending = pendingRestore;
+        path = metaPath;
+        url = metaUrl;
+        emb = embeddedMode;
+        eS = embOrigTrimStart;
+        eE = embOrigTrimEnd;
+        flac = embeddedFlac;
+        flacSerial = embeddedFlacSerial;
+        flacTS = embeddedFlacTrimStart;
+        flacTE = embeddedFlacTrimEnd;
+    }
+
+    bool attach = false;
+    if (pending != nullptr)
+    {
+        // setStateInformation ran but the message thread has not applied it yet: save what the host gave us,
+        // not the previous sample
+        state.setProperty ("samplePath", pending->path, nullptr);
+        state.setProperty ("sourceUrl", pending->url, nullptr);
+        state.setProperty ("trimStart", (double) pending->trimStart, nullptr);
+        state.setProperty ("trimEnd", (double) pending->trimEnd, nullptr);
+        state.setProperty ("sliceMode", pending->sliceMode, nullptr);
+        state.setProperty ("bpm", (double) (pending->hasBpm ? pending->bpm : 0.0f), nullptr);
+        state.setProperty ("bpmOctave", pending->bpmOctave, nullptr);
+        flac = pending->flac;
+        attach = flac != nullptr && flac->getSize() > 0;
+        if (attach)
+        {
+            state.setProperty ("embTrimStart", (double) pending->embTrimStart, nullptr);
+            state.setProperty ("embTrimEnd", (double) pending->embTrimEnd, nullptr);
+        }
+    }
+    else
+    {
+        // Playing the embedded selection: trims are saved in coordinates of the original, so the source file still fits if it returns
+        auto toOrig = [&] (float t) { return emb ? eS + t * (eE - eS) : t; };
+
+        state.setProperty ("samplePath", path, nullptr);
+        state.setProperty ("sourceUrl", url, nullptr);
+        state.setProperty ("trimStart", (double) toOrig (trimStart.load()), nullptr);
+        state.setProperty ("trimEnd", (double) toOrig (trimEnd.load()), nullptr);
+        state.setProperty ("sliceMode", sliceMode.load(), nullptr);
+        state.setProperty ("bpm", (double) bpmValue.load(), nullptr);   // shown tempo incl. octave (BEAT works without editor)
+        state.setProperty ("bpmOctave", bpmOctave.load(), nullptr);
+
+        // The cached block belongs to the current sample (selection may lag a few hundred ms behind; its own range is saved)
+        attach = flac != nullptr && flac->getSize() > 0 && flacSerial == sampleSerial.load();
+        if (attach)
+        {
+            state.setProperty ("embTrimStart", (double) toOrig (flacTS), nullptr);
+            state.setProperty ("embTrimEnd", (double) toOrig (flacTE), nullptr);
+        }
+    }
+    if (attach)
+        state.setProperty ("embBytes", (juce::int64) flac->getSize(), nullptr);
 
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, dest);
+
+    if (attach && dest.getSize() > 0)
+    {
+        juce::MemoryOutputStream mos (dest, true);
+        mos.writeInt (kEmbedMagic);
+        mos.writeInt64 ((juce::int64) flac->getSize());
+        mos.write (flac->getData(), flac->getSize());
+    }
 }
 
 void SampleGrabberProcessor::setStateInformation (const void* data, int size)
 {
-    if (auto xml = getXmlFromBinary (data, size))
+    // A damaged project must never take the host down: allocation failures end the restore quietly
+    try
     {
+        auto xml = getXmlFromBinary (data, size);
+        if (xml == nullptr)
+            return;
+
         auto state = juce::ValueTree::fromXml (*xml);
         if (! state.isValid())
             return;
 
-        // Remove old ms fades (from before the % fades): APVTS ignores unknown IDs but they would be saved forever
+        RestoreInfo info;
+
+        // Appended FLAC chunk (see getStateInformation): every length is checked against the real data size
+        {
+            const auto strLen = (juce::int64) juce::ByteOrder::littleEndianInt (juce::addBytesToPointer (data, 4));
+            const juce::int64 pos = 8 + strLen + 1;
+            if (pos + 12 <= (juce::int64) size
+                && (juce::int32) juce::ByteOrder::littleEndianInt (juce::addBytesToPointer (data, (size_t) pos)) == kEmbedMagic)
+            {
+                const auto n = (juce::int64) juce::ByteOrder::littleEndianInt64 (juce::addBytesToPointer (data, (size_t) pos + 4));
+                if (n > 0 && n <= (juce::int64) size - pos - 12)
+                    info.flac = std::make_shared<const juce::MemoryBlock> (juce::addBytesToPointer (data, (size_t) pos + 12), (size_t) n);
+                else
+                    logLine ("state: embedded audio chunk has an invalid length - ignored");
+            }
+        }
+
+        // Remove old ms fades (from before the % fades) and parameters with non-finite values (APVTS default instead)
         for (int i = state.getNumChildren(); --i >= 0;)
         {
-            const auto id = state.getChild (i).getProperty ("id").toString();
-            if (id == "fadeIn" || id == "fadeOut")
+            const auto child = state.getChild (i);
+            const auto id = child.getProperty ("id").toString();
+            if (id == "fadeIn" || id == "fadeOut" || (child.hasProperty ("value") && ! std::isfinite ((double) child.getProperty ("value"))))
                 state.removeChild (i, nullptr);
         }
 
-        apvts.replaceState (state);
-        sliceMode = (int) state.getProperty ("sliceMode", (int) SliceMode::transient);
-
-        const juce::File f (state.getProperty ("samplePath").toString());
-        if (f.existsAsFile() && loadSample (f, false))
+        auto finite01 = [&] (const char* id, double def)
         {
-            history.clear();   // new plugin state: the old BACK stack no longer belongs to it
-            setTrim ((float) (double) state.getProperty ("trimStart", 0.0),
-                     (float) (double) state.getProperty ("trimEnd", 1.0));
+            const double v = state.getProperty (id, def);
+            return (float) juce::jlimit (0.0, 1.0, std::isfinite (v) ? v : def);
+        };
+
+        info.path = state.getProperty ("samplePath").toString();
+        info.url = state.getProperty ("sourceUrl").toString();
+        info.trimStart = finite01 ("trimStart", 0.0);
+        info.trimEnd = finite01 ("trimEnd", 1.0);
+        if (info.trimEnd < info.trimStart)
+            std::swap (info.trimStart, info.trimEnd);
+        info.sliceMode = juce::jlimit (0, 2, (int) state.getProperty ("sliceMode", (int) SliceMode::transient));
+        const double bpm = state.getProperty ("bpm", 0.0);
+        info.hasBpm = state.hasProperty ("bpm") && std::isfinite (bpm) && bpm >= 30.0 && bpm <= 400.0;
+        info.bpm = info.hasBpm ? (float) bpm : 0.0f;
+        info.bpmOctave = juce::jlimit (-2, 2, (int) state.getProperty ("bpmOctave", 0));
+        info.embTrimStart = finite01 ("embTrimStart", (double) info.trimStart);
+        info.embTrimEnd = finite01 ("embTrimEnd", (double) info.trimEnd);
+        if (info.embTrimEnd <= info.embTrimStart)
+        {
+            info.embTrimStart = 0.0f;   // unusable range: treat the embedded audio as the whole (unknown) original
+            info.embTrimEnd = 1.0f;
+        }
+
+        // Our own properties are not APVTS parameters; removing them keeps apvts.state clean
+        for (auto id : { "samplePath", "sourceUrl", "trimStart", "trimEnd", "sliceMode", "bpm", "bpmOctave",
+                         "embTrimStart", "embTrimEnd", "embBytes" })
+            state.removeProperty (id, nullptr);
+
+        apvts.replaceState (state);   // parameters right away (hosts may read them back immediately)
+
+        {
+            auto p = std::make_shared<const RestoreInfo> (std::move (info));
+            const juce::ScopedLock ml (metaLock);
+            std::swap (pendingRestore, p);   // an older, not yet applied restore is dropped (outside the lock)
         }
     }
+    catch (const std::bad_alloc&)
+    {
+        logLine ("state: out of memory while reading the plugin state - ignored");
+        return;
+    }
+
+    // Loading the sample touches message-thread-only data (history, flux, editor): never on a host worker thread
+    if (juce::MessageManager::getInstanceWithoutCreating() == nullptr || juce::MessageManager::existsAndIsCurrentThread())
+    {
+        applyPendingRestore();
+    }
+    else
+    {
+        juce::WeakReference<SampleGrabberProcessor> weak (this);
+        juce::MessageManager::callAsync ([weak]
+        {
+            if (auto* p = weak.get())
+                p->applyPendingRestore();
+        });
+    }
+}
+
+void SampleGrabberProcessor::applyPendingRestore()
+{
+    std::shared_ptr<const RestoreInfo> info;
+    {
+        const juce::ScopedLock ml (metaLock);
+        info = pendingRestore;
+    }
+    if (info == nullptr)
+        return;   // already applied (several setStateInformation calls before the message thread ran)
+
+    try
+    {
+        applyRestore (*info);
+    }
+    catch (const std::bad_alloc&)
+    {
+        logLine ("state: out of memory while restoring the sample - previous sample kept");
+    }
+
+    std::shared_ptr<const RestoreInfo> done;
+    {
+        const juce::ScopedLock ml (metaLock);
+        if (pendingRestore == info)
+            std::swap (pendingRestore, done);   // a newer one stays pending for its own callback
+    }
+}
+
+void SampleGrabberProcessor::applyRestore (const RestoreInfo& info)
+{
+    sliceMode = info.sliceMode;
+    gLastSliceLogKey = -1;
+
+    const juce::File orig = juce::File::isAbsolutePath (info.path) ? juce::File (info.path) : juce::File();
+    const auto f = sg::storage::remapLegacyPath (orig);
+    juce::String note;
+    bool loaded = false;
+
+    auto restoreTempo = [&]
+    {
+        if (info.hasBpm && info.bpm > 0.0f)
+        {
+            bpmOctave.store (info.bpmOctave);
+            bpmValue = info.bpm;   // BEAT slices right away, also without editor (the editor re-analyses anyway)
+        }
+        recomputeSlices();
+    };
+
+    // Decoder for the embedded FLAC; header values are checked before any buffer is allocated
+    auto openFlac = [&]() -> std::unique_ptr<juce::AudioFormatReader>
+    {
+        juce::FlacAudioFormat flacFmt;
+        std::unique_ptr<juce::AudioFormatReader> rd (flacFmt.createReaderFor (new juce::MemoryInputStream (*info.flac, false), true));
+        if (rd == nullptr || ! std::isfinite (rd->sampleRate) || rd->sampleRate < 1.0 || rd->sampleRate > 655350.0
+            || rd->numChannels < 1 || rd->numChannels > 2 || rd->lengthInSamples < 2
+            || (double) rd->lengthInSamples > kMaxEmbedSeconds * rd->sampleRate + 1.0)
+        {
+            logLine ("state: embedded audio is damaged or implausible - ignored");
+            return nullptr;
+        }
+        return rd;
+    };
+
+    if (orig != juce::File() && f.existsAsFile() && loadSample (f, false, info.url))
+    {
+        setTrim (info.trimStart, info.trimEnd, false);
+        restoreTempo();
+        loaded = true;
+
+        // Saved FLAC covers exactly this selection (same length/rate/channels): reuse it, no re-encode needed
+        if (info.flac != nullptr && std::abs (info.embTrimStart - info.trimStart) < 1.0e-5f && std::abs (info.embTrimEnd - info.trimEnd) < 1.0e-5f)
+            if (auto rd = openFlac())
+            {
+                const auto reg = getRegion (juce::jmax (1, getNumSamples()));
+                if (rd->lengthInSamples == (juce::int64) (reg.second - reg.first)
+                    && std::abs (rd->sampleRate - fileRate.load()) < 0.5 && hasSample()
+                    && (int) rd->numChannels == getSnapshot()->getNumChannels())
+                    seedEmbedded (info.flac);
+            }
+    }
+    else if (info.flac != nullptr)
+    {
+        auto rd = openFlac();
+        if (rd != nullptr && installFromReader (*rd, orig, false, info.url, true, info.embTrimStart, info.embTrimEnd))
+        {
+            seedEmbedded (info.flac);   // before narrowing the trim: the block is the whole embedded audio
+
+            // The saved selection may be narrower than the embedded range (saved while the FLAC was a step behind)
+            const float w = info.embTrimEnd - info.embTrimStart;
+            if (w > 1.0e-6f && info.trimStart >= info.embTrimStart - 1.0e-5f && info.trimEnd <= info.embTrimEnd + 1.0e-5f)
+            {
+                const float ls = juce::jlimit (0.0f, 1.0f, (info.trimStart - info.embTrimStart) / w);
+                const float le = juce::jlimit (0.0f, 1.0f, (info.trimEnd - info.embTrimStart) / w);
+                if (le > ls && (ls > 1.0e-4f || le < 1.0f - 1.0e-4f))
+                    setTrim (ls, le, false);
+            }
+            restoreTempo();
+            note = "SOURCE MISSING - USING SAVED SELECTION";
+            loaded = true;
+            logLine ("state: source missing (" + info.path + "), loaded embedded selection " + juce::String ((double) rd->lengthInSamples / rd->sampleRate, 2) + " s");
+        }
+    }
+
+    if (! loaded)
+    {
+        if (info.path.isNotEmpty())
+        {
+            note = "SOURCE MISSING - NO SAVED AUDIO";
+            logLine ("state: source missing (" + info.path + "), no usable embedded audio");
+        }
+        if (! hasSample())
+        {
+            // Keep the reference so saving again does not lose it
+            const juce::ScopedLock ml (metaLock);
+            metaPath = orig.getFullPathName();
+            metaTitle = sg::storage::titleFromFile (orig);
+            metaUrl = info.url;
+            trimStart = info.trimStart;
+            trimEnd = info.trimEnd;
+        }
+        recomputeSlices();   // slice mode may differ for the sample that stays loaded
+    }
+
+    history.clear();   // new plugin state: the old BACK stack no longer belongs to it
+    updateInUse();
+    {
+        const juce::ScopedLock ml (metaLock);
+        restoreNote = note;
+    }
+    ++stateVersion;
 }
 
 //==============================================================================

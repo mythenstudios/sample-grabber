@@ -1,13 +1,11 @@
 #include "Downloader.h"
+#include "Storage.h"
 #include <juce_events/juce_events.h>
 
 juce::File Downloader::dataDir (const juce::String& sub)
 {
-    // Persistent folder (not /tmp) so saved projects can find the sample again
-    auto dir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                   .getChildFile ("SampleGrabber").getChildFile (sub);
-    dir.createDirectory();
-    return dir;
+    // Persistent cache folder (not /tmp) so saved projects can find the sample again; cleaned only by CacheManager
+    return sg::storage::cacheSubdir (sub);
 }
 
 void Downloader::grab (const juce::String& url,
