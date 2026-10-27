@@ -95,7 +95,11 @@ Sample Grabber is a tool. You are responsible for having the rights to the audio
 
 ## License
 
-All rights reserved. This repository is private; licensing will be decided before any public release.
+Sample Grabber is free software, licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-or-later).
+
+Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+
+Third-party components keep their own licenses (see the table above).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/divider-dark.svg">
