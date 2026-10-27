@@ -27,6 +27,26 @@ namespace
 
     std::atomic<bool> startupDone { false };   // once per process, even if the CacheManager is recreated
 
+    constexpr juce::int64 kProbeJsonKeepMs = 15 * 60 * 1000;
+
+    std::mutex idMutex;
+    std::vector<std::pair<juce::String, juce::String>>& urlIds()   // url -> video id, newest last
+    {
+        static std::vector<std::pair<juce::String, juce::String>> v;
+        return v;
+    }
+    juce::StringArray& fetchesInFlight()
+    {
+        static juce::StringArray a;
+        return a;
+    }
+    std::map<const void*, juce::StringArray>& jobFiles()
+    {
+        static std::map<const void*, juce::StringArray> m;
+        return m;
+    }
+    constexpr juce::int64 kClearWritingMs = 5000;   // CLEAR NOW: files modified this recently may still be written (other processes)
+
     juce::File envDir (const char* name)
     {
         const auto env = juce::SystemStats::getEnvironmentVariable (name, {}).trim();
@@ -77,7 +97,8 @@ namespace sg::storage
         bool onlyOurs = true;
         if (root.isDirectory())
             for (const auto& c : root.findChildFiles (juce::File::findFilesAndDirectories, false, "*", juce::File::FollowSymlinks::no))
-                if (! (c.isDirectory() && (c.getFileName() == "downloads" || c.getFileName() == "imports" || c.getFileName() == "staging")))
+                if (! (c.isDirectory() && (c.getFileName() == "downloads" || c.getFileName() == "imports" || c.getFileName() == "staging"
+                                       || c.getFileName() == "tmp")))
                     onlyOurs = false;
 
         if (! isDefault && ! onlyOurs)
@@ -193,9 +214,37 @@ namespace sg::storage
         return out;
     }
 
-    juce::String titleFromFile (const juce::File& f)
+    bool isCacheSource (const juce::File& f)
+    {
+        const auto parent = f.getParentDirectory();
+        for (auto sub : { "downloads", "imports" })
+            if (parent == cacheRoot().getChildFile (sub) || parent == appDataDir().getChildFile (sub))
+                return true;
+        return false;
+    }
+
+    juce::String stripRangeTag (const juce::File& f, sg::range::Range* rangeOut)
     {
         auto n = f.getFileNameWithoutExtension();
+        if (rangeOut != nullptr)
+            *rangeOut = {};
+        if (! isCacheSource (f))
+            return n;
+
+        const int us = n.lastIndexOfChar ('_');
+        sg::range::Range r;
+        if (us > 0 && sg::range::parseFileTag (n.substring (us + 1), r))
+        {
+            n = n.substring (0, us);
+            if (rangeOut != nullptr)
+                *rangeOut = r;
+        }
+        return n;
+    }
+
+    juce::String titleFromFile (const juce::File& f)
+    {
+        auto n = stripRangeTag (f);   // "<title>_<id>_r3720-3930" -> "<title>_<id>" (cache sources only)
 
         // Own export names: <title>_padNN_<8 hex> or <title>_sel_<8 hex> (pad dragged back into the plugin)
         auto isHex = [] (const juce::String& s)
@@ -305,6 +354,115 @@ namespace sg::storage
         sg::settings::set ("autoClean", m == AutoClean::off ? "off" : m == AutoClean::days7 ? "7d" : "1gb");
     }
 
+    bool getKeepDownloads()
+    {
+        return sg::settings::get ("keepDownloads", "1") != "0";
+    }
+
+    void setKeepDownloads (bool keep)
+    {
+        sg::settings::set ("keepDownloads", keep ? "1" : "0");
+    }
+
+    bool deleteCacheSource (const juce::File& f)
+    {
+        juce::String why;
+        const auto root = cacheRoot();
+        const auto parent = f.getParentDirectory();
+        const bool ours = parent == root.getChildFile ("downloads") || parent == root.getChildFile ("imports");
+        if (! ours || ! f.existsAsFile() || f.isSymbolicLink() || ! isSafeCacheRoot (root, why))
+        {
+            logLine ("keep downloads off: not deleting " + f.getFullPathName() + (why.isNotEmpty() ? " (" + why + ")" : juce::String()));
+            return false;
+        }
+        const bool ok = f.deleteFile();
+        logLine (juce::String (ok ? "keep downloads off: deleted " : "keep downloads off: could not delete ") + f.getFullPathName());
+        return ok;
+    }
+
+    bool isValidVideoId (const juce::String& id)
+    {
+        return id.length() >= 6 && id.containsOnly ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-");
+    }
+
+    void rememberVideoId (const juce::String& url, const juce::String& id)
+    {
+        if (url.isEmpty() || ! isValidVideoId (id))
+            return;
+        const std::lock_guard<std::mutex> g (idMutex);
+        auto& v = urlIds();
+        v.erase (std::remove_if (v.begin(), v.end(), [&] (const auto& e) { return e.first == url; }), v.end());
+        v.emplace_back (url, id);
+        if (v.size() > 64)
+            v.erase (v.begin());
+    }
+
+    juce::String videoIdFor (const juce::String& url)
+    {
+        const std::lock_guard<std::mutex> g (idMutex);
+        for (const auto& e : urlIds())
+            if (e.first == url)
+                return e.second;
+        return {};
+    }
+
+    bool tryBeginFetch (const juce::String& id)
+    {
+        const std::lock_guard<std::mutex> g (idMutex);
+        if (fetchesInFlight().contains (id))
+            return false;
+        fetchesInFlight().add (id);
+        return true;
+    }
+
+    void endFetch (const juce::String& id)
+    {
+        const std::lock_guard<std::mutex> g (idMutex);
+        fetchesInFlight().removeString (id);
+    }
+
+    void setJobFiles (const void* owner, const juce::StringArray& nameParts)
+    {
+        const std::lock_guard<std::mutex> g (idMutex);
+        if (nameParts.isEmpty())
+            jobFiles().erase (owner);
+        else
+            jobFiles()[owner] = nameParts;
+    }
+
+    bool isBeingWritten (const juce::File& f)
+    {
+        const auto n = f.getFileName();
+        if (n.endsWith (".part") || n.contains (".part-Frag") || n.contains (".temp.") || n.endsWith (".ytdl") || n.endsWith (".tmp"))
+            return true;
+        const std::lock_guard<std::mutex> g (idMutex);
+        for (const auto& id : fetchesInFlight())
+            if (n.contains ("_" + id))
+                return true;
+        for (const auto& kv : jobFiles())
+            for (const auto& part : kv.second)
+                if (part.isNotEmpty() && n.contains (part))
+                    return true;
+        return false;
+    }
+
+    bool isProbeJson (const juce::File& f)
+    {
+        const auto n = f.getFileName();
+        return f.getParentDirectory() == cacheRoot().getChildFile ("tmp") && n.startsWith ("probe-") && n.endsWith (".info.json");
+    }
+
+    void sweepProbeJsons (const juce::File& root, juce::int64 maxAgeMs)
+    {
+        const auto dir = root.getChildFile ("tmp");
+        if (! dir.isDirectory())
+            return;
+        const auto now = juce::Time::currentTimeMillis();
+        for (const auto& f : dir.findChildFiles (juce::File::findFiles, false, "probe-*.info.json", juce::File::FollowSymlinks::no))
+            if (now - f.getLastModificationTime().toMilliseconds() > maxAgeMs && f.deleteFile())
+                logLine ("cache: removed old probe info " + f.getFileName());
+    }
+
     juce::String formatBytes (juce::int64 b)
     {
         if (b < 0)
@@ -394,15 +552,19 @@ void CacheManager::run()
             sendChangeMessage();
             sg::storage::ensureCacheRoot();
             migrateLegacy();
+            sg::storage::sweepProbeJsons (root, 10 * 60 * 1000);
             wantAuto = true;
         }
 
         if (wantClear.exchange (false))
         {
             wantAuto = false;   // clearing covers it
+            // Short enough for the overlay's note line (<= 40 characters): size dropped when a download runs
             const auto r = clean (root, sg::storage::AutoClean::off, true);
-            note = "CLEARED " + juce::String (r.deleted) + " FILES, " + sg::storage::formatBytes (r.freed)
-                   + (r.kept > 0 ? ", " + juce::String (r.kept) + " IN USE KEPT" : juce::String());
+            const auto dot = juce::String::fromUTF8 (" \xc2\xb7 ");
+            note = "CLEARED " + juce::String (r.deleted) + (r.keptBusy > 0 ? juce::String() : dot + sg::storage::formatBytes (r.freed))
+                   + (r.keptInUse > 0 ? dot + juce::String (r.keptInUse) + " IN USE" : juce::String())
+                   + (r.keptBusy > 0 ? dot + juce::String (r.keptBusy) + " BEING WRITTEN" : juce::String());
         }
         else if (wantAuto.exchange (false))
         {
@@ -453,7 +615,7 @@ CacheManager::CleanResult CacheManager::clean (const juce::File& root, sg::stora
     const char* modeName = clearAll ? "CLEAR NOW" : mode == sg::storage::AutoClean::off ? "OFF"
                          : mode == sg::storage::AutoClean::days7 ? "7 DAYS" : "1 GB MAX";
 
-    struct Entry { juce::File file; juce::int64 size, mtime; bool isProtected, isStaging; };
+    struct Entry { juce::File file; juce::int64 size, mtime; bool isProtected, isStaging, inUse; };
     std::vector<Entry> entries;
     juce::int64 total = 0;
 
@@ -463,11 +625,14 @@ CacheManager::CleanResult CacheManager::clean (const juce::File& root, sg::stora
         if (! f.isAChildOf (root))
             continue;
         const auto mtime = f.getLastModificationTime().toMilliseconds();
-        const bool young = now - mtime < kProtectYoungMs;
         if (f.getFileName() == sg::storage::cacheMarkerName)
             continue;
+        // Auto-clean: everything younger than 2 min. CLEAR NOW (user asked for it): only what is really being written.
+        const bool young = sg::storage::isProbeJson (f) ? now - mtime < kProbeJsonKeepMs
+                         : clearAll ? (now - mtime < kClearWritingMs || sg::storage::isBeingWritten (f))
+                                    : now - mtime < kProtectYoungMs;
         const bool used = sg::storage::isInUse (f);
-        entries.push_back ({ f, f.getSize(), mtime, young || used, f.isAChildOf (staging) });
+        entries.push_back ({ f, f.getSize(), mtime, young || used, f.isAChildOf (staging), used });
         total += entries.back().size;
     }
 
@@ -492,7 +657,10 @@ CacheManager::CleanResult CacheManager::clean (const juce::File& root, sg::stora
         if (e.isProtected)
         {
             if (clearAll)
+            {
                 ++res.kept;
+                ++(e.inUse ? res.keptInUse : res.keptBusy);
+            }
             continue;
         }
 
@@ -523,7 +691,8 @@ CacheManager::CleanResult CacheManager::clean (const juce::File& root, sg::stora
     if (res.deleted > 0 || clearAll)
         logLine (juce::String ("cache clean (") + modeName + "): " + juce::String (res.deleted) + " files, "
                  + sg::storage::formatBytes (res.freed) + " freed, cache now " + sg::storage::formatBytes (total)
-                 + (res.kept > 0 ? ", " + juce::String (res.kept) + " protected (in use or < 2 min old)" : juce::String()));
+                 + (res.kept > 0 ? ", " + juce::String (res.keptInUse) + " in use + " + juce::String (res.keptBusy)
+                                       + (clearAll ? " being written" : " < 2 min old") + " kept" : juce::String()));
     return res;
 }
 
@@ -601,7 +770,10 @@ int CacheManager::runSelfTest()
         { "downloads/old_8d.wav",      300, 192.0 },
         { "downloads/mid_3d.wav",      300,  72.0 },
         { "downloads/inuse_9d.wav",    300, 216.0 },   // registered as in use -> never deleted
-        { "downloads/new_1min.part",   300,   0.01 },  // younger than 2 min -> never deleted
+        { "downloads/new_1min.part",   300,   0.01 },  // being written (.part) -> never deleted
+        { "downloads/fresh_10s.wav",     1,  10.0 / 3600.0 },   // 10 s old, not in use: auto keeps it, CLEAR NOW deletes it
+        { "downloads/now_1s.wav",        1,   1.0 / 3600.0 },   // modified 1 s ago: may be written by another process
+        { "downloads/T_jobid1.m4a",      1,  60.0 / 3600.0 },   // file of a running job (setJobFiles) -> kept
         { "imports/conv_2d.wav",       100,  48.0 },
         { "staging/inst-dead/x.wav",     1,  30.0 },   // staging leftover > 24 h
         { "staging/inst-live/y.wav",     1,   1.0 },
@@ -659,6 +831,7 @@ int CacheManager::runSelfTest()
 
         expect ("downloads/inuse_9d.wav", true);
         expect ("downloads/new_1min.part", true);
+        expect ("downloads/fresh_10s.wav", true);   // auto-clean keeps the 2 min rule
         expect ("staging/inst-dead/x.wav", false);
         expect ("staging/inst-live/y.wav", true);
         if (mode == AC::off)   { expect ("downloads/old_10d.wav", true); expect ("downloads/old_8d.wav", true); }
@@ -676,13 +849,25 @@ int CacheManager::runSelfTest()
 
     build();
     sg::storage::setInUse (&owner, { inUsePath });
+    static int jobOwner = 0;
+    sg::storage::setJobFiles (&jobOwner, { "_jobid1." });
     std::fprintf (stderr, "[SG-CACHE] ---- CLEAR NOW ----\n");
-    clean (root, AC::off, true);
+    const auto cleared = clean (root, AC::off, true);
     listing ("CLEAR NOW");
+    std::fprintf (stderr, "[SG-CACHE] CLEAR NOW: deleted %d, kept %d in use + %d being written\n", cleared.deleted, cleared.keptInUse, cleared.keptBusy);
     expect ("downloads/inuse_9d.wav", true);
     expect ("downloads/new_1min.part", true);
+    expect ("downloads/now_1s.wav", true);
+    expect ("downloads/T_jobid1.m4a", true);
+    expect ("downloads/fresh_10s.wav", false);
     expect ("downloads/old_10d.wav", false);
     expect ("imports/conv_2d.wav", false);
+    if (cleared.keptInUse != 1 || cleared.keptBusy != 3)
+    {
+        std::fprintf (stderr, "[SG-CACHE] FAIL: kept counts %d/%d, expected 1 in use / 3 being written\n", cleared.keptInUse, cleared.keptBusy);
+        ++failures;
+    }
+    sg::storage::setJobFiles (&jobOwner, {});
 
     // Marker missing -> nothing may be deleted, not even by CLEAR NOW
     build();

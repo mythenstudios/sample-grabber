@@ -2,6 +2,8 @@
 #include "PluginProcessor.h"
 #include "ui/SGLookAndFeel.h"
 #include "AudioSettingsPanel.h"
+#include "Downloader.h"
+#include "TimeRange.h"
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -80,7 +82,8 @@ public:
 
     ~MainWindow() override
     {
-        if (auto xml = deviceManager.createStateXml())
+        // Snapshot runs (developer aid) never overwrite the user's audio setup
+        if (auto xml = juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT", {}).isEmpty() ? deviceManager.createStateXml() : nullptr)
         {
             settingsFile.getParentDirectory().createDirectory();
             xml->writeTo (settingsFile);
@@ -486,6 +489,272 @@ namespace selftest
     }
 }
 
+namespace selftest
+{
+    // SG_RANGE_SELFTEST=1: range parsing/formatting/guard, link start times, range tags in cache names (paths only)
+    int runRange()
+    {
+        int failures = sg::range::runSelfTest();
+        auto expect = [&] (bool ok, const juce::String& what)
+        {
+            std::fprintf (stderr, "[SG-RANGE] %s %s\n", ok ? "ok  " : "FAIL", what.toRawUTF8());
+            if (! ok)
+                ++failures;
+        };
+
+        const auto dl = sg::storage::cacheRoot().getChildFile ("downloads");
+        const auto im = sg::storage::cacheRoot().getChildFile ("imports");
+        struct N { juce::File f; const char* title; const char* range; };
+        const N names[] = { { dl.getChildFile ("Big_Buck_Bunny_aqz-KE-bpKQ_r60-80.wav"), "Big_Buck_Bunny", "1:00-1:20" },
+                            { dl.getChildFile ("Big_Buck_Bunny_aqz-KE-bpKQ.wav"), "Big_Buck_Bunny", "" },
+                            { dl.getChildFile ("Talk_abcdefghijk_r3720p5-end.wav"), "Talk", "1:02:00.5-" },
+                            { im.getChildFile ("justice_mid_r10-25.wav"), "justice_mid", "0:10-0:25" },
+                            { juce::File ("/home/x/My_Song_r10-25.wav"), "My_Song_r10-25", "" } };   // user file: name stays
+        for (const auto& n : names)
+        {
+            sg::range::Range r;
+            sg::storage::stripRangeTag (n.f, &r);
+            const auto title = sg::storage::titleFromFile (n.f);
+            expect (title == n.title && sg::range::toText (r) == n.range,
+                    n.f.getFileName() + " -> title '" + title + "' range '" + sg::range::toText (r) + "'");
+        }
+
+        std::fprintf (stderr, "[SG-RANGE] %s (%d failures total)\n", failures == 0 ? "ALL OK" : "FAILURES", failures);
+        return failures == 0 ? 0 : 1;
+    }
+
+    // SG_GRAB_SELFTEST=<url|file> [SG_GRAB_RANGE=<from-to>] [SG_GRAB_PROBE_ONLY=1], needs SG_CACHE_DIR (scratch).
+    // probe -> guard verdict -> (range) grab/import -> length check -> load + trim + state -> delete the cache file
+    // (as KEEP DOWNLOADS OFF does) -> restore (source missing) -> grab again -> saved trim restored? -> delete again.
+    class GrabTest
+    {
+    public:
+        explicit GrabTest (std::function<void (int)> finishedIn) : finished (std::move (finishedIn)) {}
+
+        void start (const juce::String& srcText)
+        {
+            if (! requireScratch())
+                return done (2);
+
+            isUrl = srcText.startsWithIgnoreCase ("http://") || srcText.startsWithIgnoreCase ("https://");
+            src = isUrl ? srcText : juce::File::getCurrentWorkingDirectory().getChildFile (srcText).getFullPathName();
+            const auto p = sg::range::parse (juce::SystemStats::getEnvironmentVariable ("SG_GRAB_RANGE", {}));
+            if (! p.ok)
+            {
+                log ("range invalid: " + p.error);
+                return done (2);
+            }
+            range = p.range;
+            rangeText = sg::range::toText (range);
+            probeOnly = juce::SystemStats::getEnvironmentVariable ("SG_GRAB_PROBE_ONLY", {}).isNotEmpty();
+
+            t0 = now();
+            auto cb = [this] (Downloader::Result r) { onProbe (r); };
+            if (isUrl)
+                dl.probe (src, cb);
+            else
+                dl.probeFile (juce::File (src), cb);
+        }
+
+    private:
+        static double now() { return juce::Time::getMillisecondCounterHiRes(); }
+        static void log (const juce::String& s) { std::fprintf (stderr, "[SG-GRAB] %s\n", s.toRawUTF8()); }
+        void expect (bool ok, const juce::String& what) { log ((ok ? "ok   " : "FAIL ") + what); if (! ok) ++failures; }
+        void done (int code) { if (finished) finished (code); }
+
+        void onProbe (const Downloader::Result& r)
+        {
+            log ("probe " + juce::String (now() - t0, 0) + " ms: ok=" + juce::String ((int) r.ok) + " duration="
+                 + (r.duration >= 0.0 ? juce::String (r.duration, 3) + " s (" + sg::range::formatTime (r.duration) + ")" : juce::String ("unknown"))
+                 + " title='" + r.title + "' msg='" + r.message + "'");
+            if (! r.ok)
+                return done (1);
+            duration = r.duration;
+
+            const auto v = sg::range::guard (range, duration, isUrl);
+            const char* kinds[] = { "GRAB", "CONFIRM (GRAB ALL)", "BLOCKED" };
+            log ("guard for range '" + rangeText + "': " + kinds[(int) v.kind] + (v.status.isNotEmpty() ? " - " + v.status : juce::String()));
+            if (isUrl && range.set)
+                log (juce::String ("strategy: ") + (Downloader::cutsLocally (range, duration) ? "whole audio + local cut" : "--download-sections"));
+            if (probeOnly)
+                return done (failures == 0 ? 0 : 1);
+            if (v.kind != sg::range::Verdict::Kind::grab)
+            {
+                log ("not downloading (guard)");
+                return done (failures == 0 ? 0 : 1);
+            }
+            fetch ([this] (Downloader::Result res) { onFirst (res); });
+
+            // SG_GRAB_CANCEL_AFTER=<ms>: cancel the running fetch, then no process of the job and no partial file may remain
+            const int cancelMs = juce::SystemStats::getEnvironmentVariable ("SG_GRAB_CANCEL_AFTER", {}).getIntValue();
+            if (cancelMs > 0)
+                juce::Timer::callAfterDelay (cancelMs, [this] { cancelCheck(); });
+        }
+
+        void cancelCheck()
+        {
+            const auto t = now();
+            dl.cancel();
+            log ("cancel took " + juce::String (now() - t, 0) + " ms, busy=" + juce::String ((int) dl.isBusy()));
+            juce::Thread::sleep (500);
+            int survivors = 0;
+           #if JUCE_LINUX
+            const auto marker = sg::storage::cacheRoot().getFullPathName();
+            for (const auto& d : juce::File ("/proc").findChildFiles (juce::File::findDirectories, false, "*", juce::File::FollowSymlinks::no))
+                if (d.getFileName().containsOnly ("0123456789"))
+                {
+                    juce::MemoryBlock mb;
+                    juce::FileInputStream in (d.getChildFile ("cmdline"));
+                    if (in.openedOk())
+                        in.readIntoMemoryBlock (mb);
+                    auto* bytes = static_cast<char*> (mb.getData());
+                    for (size_t i = 0; i < mb.getSize(); ++i)
+                        if (bytes[i] == 0)
+                            bytes[i] = ' ';   // argv separators
+                    const auto cmd = juce::String::fromUTF8 (bytes, (int) mb.getSize());
+                    if (cmd.contains (marker))
+                    {
+                        ++survivors;
+                        log ("still running: " + d.getFileName() + " " + cmd.substring (0, 100));
+                    }
+                }
+           #endif
+            const auto left = sg::storage::cacheRoot().getChildFile ("downloads").findChildFiles (juce::File::findFiles, false);
+            for (const auto& f : left)
+                log ("left over: " + f.getFileName());
+            expect (survivors == 0, "no process of the job survives");
+            expect (left.isEmpty(), "no partial files");
+            log (failures == 0 ? "ALL OK" : "FAILURES");
+            done (failures == 0 ? 0 : 1);
+        }
+
+        void fetch (std::function<void (Downloader::Result)> then)
+        {
+            t0 = now();
+            auto prog = [] (float, juce::String) {};
+            if (isUrl)
+            {
+                dl.grab (src, range, duration, false, prog, std::move (then));
+                return;
+            }
+            int bits = 16;
+            {
+                juce::AudioFormatManager fm;
+                fm.registerBasicFormats();
+                if (std::unique_ptr<juce::AudioFormatReader> rd { fm.createReaderFor (juce::File (src)) })
+                    bits = (int) rd->bitsPerSample;
+            }
+            dl.importFile (juce::File (src), range, bits, prog, std::move (then));
+        }
+
+        int channels = 0;
+        double fileSeconds (const juce::File& f, double& rate, int& bits)
+        {
+            juce::AudioFormatManager fm;
+            fm.registerBasicFormats();
+            std::unique_ptr<juce::AudioFormatReader> rd (fm.createReaderFor (f));
+            if (rd == nullptr)
+                return -1.0;
+            rate = rd->sampleRate;
+            bits = (int) rd->bitsPerSample;
+
+            // Channels and RMS per channel (downmix check: a 5.1 centre must end up in both channels)
+            const int n = (int) juce::jmin<juce::int64> (rd->lengthInSamples, (juce::int64) (rd->sampleRate * 600.0));
+            juce::AudioBuffer<float> buf ((int) rd->numChannels, n);
+            rd->read (&buf, 0, n, 0, true, true);
+            juce::String rms;
+            for (int ch = 0; ch < buf.getNumChannels(); ++ch)
+                rms << " ch" << ch << " " << juce::String (juce::Decibels::gainToDecibels (buf.getRMSLevel (ch, 0, n), -120.0f), 1) << " dB";
+            log ("channels " + juce::String ((int) rd->numChannels) + ", RMS" + rms);
+            channels = (int) rd->numChannels;
+            return (double) rd->lengthInSamples / rd->sampleRate;
+        }
+
+        void onFirst (const Downloader::Result& r)
+        {
+            log ("fetch " + juce::String ((now() - t0) / 1000.0, 1) + " s: ok=" + juce::String ((int) r.ok) + " file='"
+                 + r.file.getFullPathName() + "' msg='" + r.message + "'");
+            expect (r.ok && r.file.existsAsFile(), "result file exists");
+            if (! r.ok)
+                return done (1);
+
+            double rate = 0.0;
+            int bits = 0;
+            const double got = fileSeconds (r.file, rate, bits);
+            const double want = sg::range::coveredSeconds (range, duration);
+            log ("length: expected " + juce::String (want, 3) + " s, actual " + juce::String (got, 3) + " s, diff "
+                 + juce::String ((got - want) * 1000.0, 1) + " ms (" + juce::String (rate, 0) + " Hz, " + juce::String (bits) + " bit, "
+                 + sg::storage::formatBytes (r.file.getSize()) + ")");
+            // Whole source: site metadata rounds the duration (YouTube: 635 s for 634.6 s), ranges must be exact
+            const double tol = range.set ? 0.25 : 1.5;
+            expect (want < 0.0 || std::abs (got - want) < tol, "length within " + juce::String (tol, 2) + " s");
+            expect (channels >= 1 && channels <= 2, "at most stereo");
+
+            sg::range::Range tag;
+            sg::storage::stripRangeTag (r.file, &tag);
+            log ("title '" + sg::storage::titleFromFile (r.file) + "', range from name '" + sg::range::toText (tag) + "'");
+            expect (tag == range, "range tag in the file name");
+
+            const auto url = isUrl ? src : src;   // local: the original path is the source (as the editor does)
+            juce::MemoryBlock st;
+            {
+                SampleGrabberProcessor a;
+                expect (a.loadSample (r.file, true, url, rangeText), "load result");
+                a.setTrim (0.2f, 0.6f);
+                expect (a.waitForBackgroundIdle (60000), "worker idle (A)");
+                a.getStateInformation (st);
+                printState ("A loaded", a);
+                expect (a.getSourceRange() == rangeText, "A range kept");
+            }
+
+            // KEEP DOWNLOADS OFF: the cache file goes away after loading
+            // (the editor does this once the FLAC is settled; here A has waited for the worker already)
+            expect (sg::storage::deleteCacheSource (r.file) && ! r.file.existsAsFile(), "cache file deleted (keep off)");
+            {
+                SampleGrabberProcessor a2;   // the saved state must carry sourceKept=false: mark and save again
+                a2.setStateInformation (st.getData(), (int) st.getSize());
+                a2.noteSourceNotKept (r.file);
+                expect (a2.waitForBackgroundIdle (60000), "worker idle (A2)");
+                st.reset();
+                a2.getStateInformation (st);
+            }
+
+            b = std::make_unique<SampleGrabberProcessor>();
+            b->setStateInformation (st.getData(), (int) st.getSize());
+            printState ("B source missing", *b);
+            expect (b->getRestoreNote().startsWith ("SAVED SELECTION LOADED"), "B note (not kept on purpose)");
+            expect (b->getSourceUrl() == url && b->getSourceRange() == rangeText, "B link + range restored");
+
+            fetch ([this] (Downloader::Result res) { onRegrab (res); });
+        }
+
+        void onRegrab (const Downloader::Result& r)
+        {
+            log ("re-grab " + juce::String ((now() - t0) / 1000.0, 1) + " s: ok=" + juce::String ((int) r.ok) + " file='" + r.file.getFullPathName() + "'");
+            expect (r.ok, "re-grab ok");
+            if (r.ok)
+            {
+                expect (b->loadSample (r.file, true, src, rangeText), "B loads re-grab");
+                printState ("B after re-grab", *b);
+                expect (std::abs (b->getTrimStart() - 0.2f) < 1.0e-4f && std::abs (b->getTrimEnd() - 0.6f) < 1.0e-4f, "saved trim restored");
+                r.file.deleteFile();
+            }
+            b.reset();
+            log (failures == 0 ? "ALL OK" : "FAILURES");
+            done (failures == 0 ? 0 : 1);
+        }
+
+        Downloader dl;
+        std::unique_ptr<SampleGrabberProcessor> b;
+        std::function<void (int)> finished;
+        juce::String src, rangeText;
+        sg::range::Range range;
+        bool isUrl = false, probeOnly = false;
+        double duration = -1.0, t0 = 0.0;
+        int failures = 0;
+    };
+}
+
 class SampleGrabberApp : public juce::JUCEApplication
 {
 public:
@@ -533,6 +802,25 @@ public:
             return;
         }
 
+        if (juce::SystemStats::getEnvironmentVariable ("SG_RANGE_SELFTEST", {}).isNotEmpty())
+        {
+            setApplicationReturnValue (selftest::runRange());
+            quit();
+            return;
+        }
+
+        const auto grabTest = juce::SystemStats::getEnvironmentVariable ("SG_GRAB_SELFTEST", {});
+        if (grabTest.isNotEmpty())
+        {
+            grabTester = std::make_unique<selftest::GrabTest> ([this] (int code)
+            {
+                setApplicationReturnValue (code);
+                juce::MessageManager::callAsync ([this] { grabTester.reset(); quit(); });
+            });
+            grabTester->start (grabTest);
+            return;
+        }
+
         const auto toolsTest = juce::SystemStats::getEnvironmentVariable ("SG_TOOLS_SELFTEST", {});
         if (toolsTest.isNotEmpty())
         {
@@ -560,6 +848,7 @@ public:
 
 private:
     std::unique_ptr<MainWindow> window;
+    std::unique_ptr<selftest::GrabTest> grabTester;
 };
 
 START_JUCE_APPLICATION (SampleGrabberApp)

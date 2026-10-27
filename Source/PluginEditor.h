@@ -7,6 +7,7 @@
 #include "KnobCell.h"
 #include "IconButton.h"
 #include "SettingsOverlay.h"
+#include "TimeRange.h"
 
 class SampleGrabberEditor : public juce::AudioProcessorEditor,
                             public juce::FileDragAndDropTarget,
@@ -36,7 +37,44 @@ private:
     void onFetchClicked();
     void startGrab();
     void beginBusy (const juce::String& status);
-    void loadFromFile (const juce::File&, const juce::String& sourceUrl = {});
+    bool loadFromFile (const juce::File&, const juce::String& sourceUrl = {}, const juce::String& sourceRange = {});
+
+    // One grab request: link or local file, optional range, length once known (probe or file header)
+    struct GrabSpec
+    {
+        bool isUrl = false;
+        juce::String url;                 // link (isUrl)
+        juce::File file;                  // local file (! isUrl)
+        bool native = false;              // JUCE reads it directly (no ffmpeg needed without a range)
+        int bits = 16;                    // native: bit depth, kept when cutting a range
+        int channels = 2;                 // native: > 2 goes through ffmpeg (stereo downmix)
+        sg::range::Range range;
+        double duration = -1.0;           // seconds, < 0 = unknown
+        int inputSerial = 0;              // inputSerial when the request started (stale results are dropped)
+    };
+
+    // Footer hint for a child that is not an IconButton (mouse enter/exit of the component and its children)
+    struct HoverRelay : public juce::MouseListener
+    {
+        std::function<void (bool)> onHover;
+        void mouseEnter (const juce::MouseEvent&) override { if (onHover) onHover (true); }
+        void mouseExit (const juce::MouseEvent&) override  { if (onHover) onHover (false); }
+    };
+
+    void grabOrConfirm();                          // GRAB / Return: GRAB ALL if a long source waits for confirmation
+    bool readRangeField (sg::range::Range& out);   // false = invalid (error shown)
+    void checkGuard (const GrabSpec&);             // range beyond end, long source (confirm), too long (blocked)
+    void proceedGrab (const GrabSpec&);
+    void setConfirm (const GrabSpec&, const juce::String& status);
+    void clearConfirm();
+    void updateFetchLabel();
+    void onInputChanged();                         // URL or range edited: drop a pending confirmation
+    void prefillRangeFromUrl();
+    void fillSourceFields();                       // URL + range of the loaded/restored sample into the fields
+    void showStatusError (const juce::String& text);
+    void showToolError (const juce::String& message);
+    std::function<void (Downloader::Result)> probeCallback (const GrabSpec&);
+    void cancelJob (const juce::String& status, bool error);   // CANCEL button, Esc, probe watchdog
     void applyRestoredState();                     // after setStateInformation: refresh widgets, note, URL field
     bool openLocalFile (const juce::File&);   // true = file type supported
     void goBack();
@@ -56,6 +94,8 @@ private:
     Downloader downloader;
 
     juce::TextEditor urlField;
+    HoverRelay rangeHover;                         // declared before rangeField -> outlives it
+    juce::TextEditor rangeField;                   // "FROM-TO" / "FROM-", empty = whole source
     juce::TextButton fetchButton { "GRAB" };
     IconButton gearButton { IconButton::Icon::gear };   // settings (theme, tools, audio); red dot = update/error
     std::unique_ptr<juce::Drawable> lockup;        // logo per theme, nullptr -> text
@@ -79,6 +119,7 @@ private:
     KnobCell gainCell, pitchCell, speedCell, fadeInCell, fadeOutCell, shapeCell;
     static constexpr int numKnobCells = 6;   // knob row: layout (resized) and divider lines (paint)
 
+    juce::Rectangle<int> rangeR;                   // range box inside the URL row (label + field)
     juce::Rectangle<int> headerR, tabsR, urlR, progR, waveLabelR, detLabelR, detR, slicesLabelR, paramsR, footerR, infoR;
 
     juce::String hoverHint;                        // hint for the transport button under the mouse (instead of a tooltip)
@@ -100,6 +141,17 @@ private:
     int lastStateVersion = 0;                      // processor.getStateVersion() already shown
     int lastEmbedWarn = 0;                         // processor.getEmbedWarnVersion() already shown
     juce::String pendingGrabUrl;                   // link of the running grab (saved with the sample for re-grabbing)
+    juce::String pendingGrabRange;                 // its range text (sg::range::toText), empty = whole source
+    juce::String grabNote;                         // appended to the progress phase (e.g. LENGTH UNKNOWN)
+    juce::String autoRangeText;                    // range text last filled in from a link (t=...), replaced on URL change
+    GrabSpec confirmSpec;                          // long source waiting for GRAB ALL
+    bool confirmPending = false;
+    int inputSerial = 0;                           // +1 on every URL/range edit
+    int jobSerial = 0;                             // +1 per cancel: results of a cancelled job are ignored
+    bool probing = false;                          // length check running (watchdog)
+    juce::uint32 probeStartMs = 0;
+    juce::String lastAutoWant;                     // start time last taken from a link (prefill once per value)
+    juce::File pendingDelete;                      // KEEP DOWNLOADS off: delete once the embedded FLAC is settled
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SampleGrabberEditor)
 };

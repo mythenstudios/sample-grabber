@@ -17,14 +17,34 @@ namespace
     bool isNative (const juce::File& f)  { return kNativeExts.contains (f.getFileExtension().toLowerCase()); }
     bool isConvert (const juce::File& f) { return kConvertExts.contains (f.getFileExtension().toLowerCase()); }
 
-    // yt-dlp appends "_<11-char-ID>" and replaces spaces with "_"
+    // yt-dlp appends "_<11-char-ID>" and replaces spaces with "_"; cache files of a section carry "_r<from>-<to>"
+    // -> "TITLE (1:02:00-1:05:30)"
     juce::String prettyName (const juce::File& f)
     {
-        auto n = f.getFileNameWithoutExtension();
+        sg::range::Range r;
+        auto n = sg::storage::stripRangeTag (f, &r);
         const int us = n.lastIndexOfChar ('_');
         if (us > 0 && n.length() - us - 1 == 11)
             n = n.substring (0, us);
-        return n.replaceCharacter ('_', ' ').toUpperCase();
+        auto out = n.replaceCharacter ('_', ' ').toUpperCase();
+        if (r.set)
+            out << " (" << sg::range::formatTime (r.from) << "-"
+                << (r.hasEnd() ? sg::range::formatTime (r.to) : juce::String ("END")) << ")";
+        return out;
+    }
+
+    // Length and bit depth from the header of a JUCE-readable file (cheap, no audio read)
+    bool readNativeInfo (const juce::File& f, double& seconds, int& bits, int& channels)
+    {
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        std::unique_ptr<juce::AudioFormatReader> r (fm.createReaderFor (f));
+        if (r == nullptr || r->sampleRate <= 0.0 || r->lengthInSamples <= 0)
+            return false;
+        seconds = (double) r->lengthInSamples / r->sampleRate;
+        bits = (int) r->bitsPerSample;
+        channels = (int) r->numChannels;
+        return true;
     }
 
     juce::String bpmString (float v)
@@ -76,7 +96,8 @@ SampleGrabberEditor::SampleGrabberEditor (SampleGrabberProcessor& p)
     urlField.setReturnKeyStartsNewLine (false);
     urlField.setJustification (juce::Justification::centredLeft);
     urlField.setBorder (juce::BorderSize<int> (0));
-    urlField.onReturnKey = [this] { startGrab(); };
+    urlField.onReturnKey = [this] { grabOrConfirm(); };
+    urlField.onEscapeKey = [this] { if (downloader.isBusy()) cancelJob ("CANCELLED", false); };
     urlField.onTextChange = [this]
     {
         const int s = detectSource (urlField.getText());
@@ -85,8 +106,25 @@ SampleGrabberEditor::SampleGrabberEditor (SampleGrabberProcessor& p)
             activeSource = s;
             repaint (tabsR);
         }
+        prefillRangeFromUrl();
+        onInputChanged();
     };
     addAndMakeVisible (urlField);
+
+    // --- Range: "FROM-TO" / "FROM-", empty = whole source (digits, ':', '.', '-' and spaces only) ---
+    rangeField.setReturnKeyStartsNewLine (false);
+    rangeField.setJustification (juce::Justification::centredLeft);
+    rangeField.setBorder (juce::BorderSize<int> (0));
+    rangeField.setInputRestrictions (24, "0123456789:.- ");
+    rangeField.onReturnKey = [this] { grabOrConfirm(); };
+    rangeField.onEscapeKey = [this] { if (downloader.isBusy()) cancelJob ("CANCELLED", false); };
+    rangeField.onTextChange = [this] { onInputChanged(); };
+    rangeHover.onHover = [this] (bool in)
+    {
+        setHoverHint (in ? "RANGE" + kDot + "FROM-TO OR FROM-, E.G. 1:02:00-1:05:30" + kDot + "EMPTY = FULL SOURCE" : "");
+    };
+    rangeField.addMouseListener (&rangeHover, true);
+    addAndMakeVisible (rangeField);
 
     fetchButton.getProperties().set ("primary", true);
     fetchButton.onClick = [this] { onFetchClicked(); };
@@ -212,6 +250,8 @@ SampleGrabberEditor::SampleGrabberEditor (SampleGrabberProcessor& p)
     lastStateVersion = processor.getStateVersion();
     if (processor.getRestoreNote().isNotEmpty())
         applyRestoredState();
+    else
+        fillSourceFields();   // editor reopened: link + range of the loaded sample (RE-GRAB fetches the same section)
 
     // Developer aid (SG_SNAPSHOT only): preset the status line for the image, e.g. to check long tool messages
     if (juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT", {}).isNotEmpty())
@@ -227,6 +267,36 @@ SampleGrabberEditor::SampleGrabberEditor (SampleGrabberProcessor& p)
         // with SG_SNAPSHOT_FILE the snapshot waits 4 s, enough for the three queries
         if (juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT_TOOLS_CHECK", {}).isNotEmpty())
             processor.tools->checkForUpdates();
+
+        // SG_SNAPSHOT_URL / SG_SNAPSHOT_RANGE: fill the URL row (the URL goes through onTextChange, i.e. t= prefill);
+        // SG_SNAPSHOT_GRABALL=1: show the long-source confirmation (button GRAB ALL)
+        const auto snapUrl = juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT_URL", {});
+        if (snapUrl.isNotEmpty())
+            urlField.setText (snapUrl, true);
+        const auto snapRange = juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT_RANGE", {});
+        if (snapRange.isNotEmpty())
+            rangeField.setText (snapRange, false);
+        if (juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT_GRABALL", {}).isNotEmpty())
+        {
+            GrabSpec spec;
+            spec.isUrl = true;
+            spec.url = snapUrl;
+            spec.duration = 4350.0;
+            juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<SampleGrabberEditor> (this), spec]
+            {
+                if (safe != nullptr)   // after the URL text-change message, which would clear it again
+                    safe->setConfirm (spec, "LONG SOURCE " + sg::range::formatDuration (spec.duration) + kDot
+                                                + "SET A RANGE (RECOMMENDED) OR GRAB ALL");
+            });
+        }
+
+        // SG_SNAPSHOT_GRAB=1: press GRAB (e.g. with SG_SNAPSHOT_URL: the image shows the running check and CANCEL)
+        if (juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT_GRAB", {}).isNotEmpty())
+            juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<SampleGrabberEditor> (this)]
+            {
+                if (safe != nullptr)
+                    safe->grabOrConfirm();
+            });
 
         // SG_SNAPSHOT_SETTINGS=1: show the settings overlay open
         if (juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT_SETTINGS", {}).isNotEmpty())
@@ -244,6 +314,10 @@ void SampleGrabberEditor::applyTheme()
                                      ui::c().textTertiary);
     urlField.applyFontToAllText (ui::mono (12.0f));   // also sets the font for new text
     urlField.applyColourToAllText (ui::c().textPrimary);
+    rangeField.setColour (juce::TextEditor::backgroundColourId, ui::c().surface1);
+    rangeField.setTextToShowWhenEmpty ("FULL", ui::c().textTertiary);
+    rangeField.applyFontToAllText (ui::mono (12.0f));
+    rangeField.applyColourToAllText (ui::c().textPrimary);
     repaint (urlR);
     shownTheme = ui::theme();
     rebuildLockup();
@@ -359,13 +433,13 @@ std::function<void (float, juce::String)> SampleGrabberEditor::progressCallback(
 {
     juce::Component::SafePointer<SampleGrabberEditor> safe (this);
 
-    return [safe] (float p, juce::String phase)
+    return [safe, token = jobSerial] (float p, juce::String phase)
     {
-        if (safe == nullptr)
+        if (safe == nullptr || token != safe->jobSerial)
             return;
 
         safe->progress = p;
-        safe->statusText = phase;
+        safe->statusText = safe->grabNote.isEmpty() ? phase : phase + kDot + safe->grabNote;
         safe->repaint (safe->progR);
     };
 }
@@ -374,31 +448,98 @@ std::function<void (Downloader::Result)> SampleGrabberEditor::doneCallback()
 {
     juce::Component::SafePointer<SampleGrabberEditor> safe (this);
 
-    return [safe] (Downloader::Result r)
+    return [safe, token = jobSerial] (Downloader::Result r)
     {
-        if (safe == nullptr)
-            return;
+        if (safe == nullptr || token != safe->jobSerial)
+            return;   // cancelled meanwhile: a finished file stays in the cache (auto-clean)
 
         safe->busy = false;
         safe->fetchButton.setEnabled (true);
+        safe->grabNote.clear();
 
         if (r.ok)
         {
             const auto url = std::exchange (safe->pendingGrabUrl, juce::String());
-            safe->loadFromFile (r.file, url);
+            const auto range = std::exchange (safe->pendingGrabRange, juce::String());
+            // Already used by another instance or a BACK entry here (same link grabbed again): never delete it
+            const bool shared = sg::storage::isInUse (r.file);
+            const bool loaded = safe->loadFromFile (r.file, url, range);
+
+            // KEEP DOWNLOADS off: the sample is in RAM and nothing reads the file again (BACK keeps buffers,
+            // staging/state/waveform work from RAM). Deleted by the timer once the embedded FLAC is cached
+            // (or skipped as too long - then the existing note shows), so a project saved right away keeps the audio.
+            if (loaded && ! sg::storage::getKeepDownloads())
+            {
+                if (shared)
+                    std::fprintf (stderr, "[SG] keep downloads off: %s is in use elsewhere - kept\n", r.file.getFullPathName().toRawUTF8());
+                else
+                    safe->pendingDelete = r.file;
+            }
             safe->processor.cache->requestAutoClean();   // after each finished grab/import (new file is registered as in use)
         }
         else
         {
-            const auto up = r.message.toUpperCase();
-            safe->statusText = up.contains ("TIKTOK")
-                ? juce::String ("ERROR") + kDot + "TIKTOK BLOCKS DOWNLOADS - SAVE THE VIDEO AND DROP THE FILE HERE"
-                : "ERROR" + kDot + up.substring (0, 70);
-            safe->isError = true;
-            safe->progress = 0.0f;
-            safe->repaint();
+            safe->pendingGrabUrl.clear();
+            safe->pendingGrabRange.clear();
+            safe->showToolError (r.message);
         }
     };
+}
+
+// Result of a length check (yt-dlp probe or ffprobe): drop it if the input changed meanwhile, else apply the guard
+std::function<void (Downloader::Result)> SampleGrabberEditor::probeCallback (const GrabSpec& specIn)
+{
+    juce::Component::SafePointer<SampleGrabberEditor> safe (this);
+
+    return [safe, spec = specIn, token = jobSerial] (Downloader::Result r) mutable
+    {
+        if (safe == nullptr || token != safe->jobSerial)
+            return;
+
+        safe->probing = false;
+        safe->busy = false;
+        safe->fetchButton.setEnabled (true);
+
+        if (spec.inputSerial != safe->inputSerial)
+        {
+            safe->statusText = "INPUT CHANGED" + kDot + "CLICK GRAB AGAIN";
+            safe->isError = false;
+            safe->progress = 0.0f;
+            safe->repaint();
+            return;
+        }
+        if (! r.ok)
+        {
+            safe->showToolError (r.message);
+            return;
+        }
+
+        spec.duration = r.duration;
+        if (r.title.isNotEmpty())
+            std::fprintf (stderr, "[SG] probe: %s -> %s, '%s'\n", (spec.isUrl ? spec.url : spec.file.getFullPathName()).toRawUTF8(),
+                          r.duration >= 0.0 ? sg::range::formatTime (r.duration).toRawUTF8() : "unknown", r.title.toRawUTF8());
+        else
+            std::fprintf (stderr, "[SG] probe: %s -> %s\n", (spec.isUrl ? spec.url : spec.file.getFullPathName()).toRawUTF8(),
+                          r.duration >= 0.0 ? sg::range::formatTime (r.duration).toRawUTF8() : "unknown");
+        safe->checkGuard (spec);
+    };
+}
+
+void SampleGrabberEditor::showStatusError (const juce::String& text)
+{
+    statusText = text;
+    isError = true;
+    progress = 0.0f;
+    repaint();
+}
+
+// Error text of yt-dlp/ffmpeg/ffprobe for the status line
+void SampleGrabberEditor::showToolError (const juce::String& message)
+{
+    const auto up = message.toUpperCase();
+    showStatusError (up.contains ("TIKTOK")
+        ? juce::String ("ERROR") + kDot + "TIKTOK BLOCKS DOWNLOADS - SAVE THE VIDEO AND DROP THE FILE HERE"
+        : "ERROR" + kDot + up.substring (0, 70));
 }
 
 void SampleGrabberEditor::changeListenerCallback (juce::ChangeBroadcaster*)
@@ -446,19 +587,32 @@ void SampleGrabberEditor::syncTools()
         }
     }
 
-    const juce::String label (tm.needsInstall() ? "INSTALL TOOLS" : "GRAB");
+    updateFetchLabel();
+    gearButton.setBadge (tm.needsAttention());
+}
+
+void SampleGrabberEditor::updateFetchLabel()
+{
+    const juce::String label (downloader.isBusy() ? "CANCEL"
+                              : processor.tools->needsInstall() ? "INSTALL TOOLS" : confirmPending ? "GRAB ALL" : "GRAB");
     if (fetchButton.getButtonText() != label)
     {
         fetchButton.setButtonText (label);
         resized();
     }
-    fetchButton.setEnabled (! busy);
-    gearButton.setBadge (tm.needsAttention());
+    const bool canClick = ! busy || downloader.isBusy();   // CANCEL stays clickable while a job runs
+    if (fetchButton.isEnabled() != canClick)
+        fetchButton.setEnabled (canClick);
 }
 
 // GRAB or INSTALL TOOLS (yt-dlp or ffmpeg missing): one click = consent to the download (~220 MB)
 void SampleGrabberEditor::onFetchClicked()
 {
+    if (downloader.isBusy())
+    {
+        cancelJob ("CANCELLED", false);
+        return;
+    }
     if (processor.tools->needsInstall())
     {
         if (! busy && ! processor.tools->isWorking())
@@ -466,7 +620,40 @@ void SampleGrabberEditor::onFetchClicked()
         syncTools();
         return;
     }
+    grabOrConfirm();
+}
+
+void SampleGrabberEditor::grabOrConfirm()
+{
+    if (busy || downloader.isBusy())
+        return;
+
+    if (confirmPending)
+    {
+        const auto spec = confirmSpec;   // second click on the same input: grab everything
+        clearConfirm();
+        proceedGrab (spec);
+        return;
+    }
     startGrab();
+}
+
+// Stops probe/download/conversion: process tree killed, partial files of the job removed, late results ignored
+void SampleGrabberEditor::cancelJob (const juce::String& status, bool error)
+{
+    ++jobSerial;
+    downloader.cancel();
+    probing = false;
+    busy = false;
+    pendingGrabUrl.clear();
+    pendingGrabRange.clear();
+    grabNote.clear();
+    statusText = status;
+    isError = error;
+    progress = 0.0f;
+    updateFetchLabel();
+    fetchButton.setEnabled (true);
+    repaint();
 }
 
 void SampleGrabberEditor::beginBusy (const juce::String& status)
@@ -474,9 +661,138 @@ void SampleGrabberEditor::beginBusy (const juce::String& status)
     busy = true;
     isError = false;
     progress = 0.0f;
-    statusText = status;
+    statusText = grabNote.isEmpty() ? status : status + kDot + grabNote;
     fetchButton.setEnabled (false);
     repaint (progR);
+}
+
+void SampleGrabberEditor::onInputChanged()
+{
+    ++inputSerial;
+    if (confirmPending)
+    {
+        clearConfirm();
+        if (! busy)
+        {
+            statusText = "READY";
+            isError = false;
+            repaint (progR);
+        }
+    }
+}
+
+void SampleGrabberEditor::setConfirm (const GrabSpec& spec, const juce::String& status)
+{
+    confirmSpec = spec;
+    confirmPending = true;
+    statusText = status;
+    isError = false;
+    progress = 0.0f;
+    updateFetchLabel();
+    repaint();
+}
+
+void SampleGrabberEditor::clearConfirm()
+{
+    confirmPending = false;
+    confirmSpec = {};
+    updateFetchLabel();
+}
+
+// Link with a start time (t=90, t=1h2m3s, start=30): put "FROM-" into an empty range field. A range filled this way
+// follows later URL edits; one the user typed is never touched. String parsing only, no network.
+void SampleGrabberEditor::prefillRangeFromUrl()
+{
+    const auto url = urlField.getText().trim();
+    juce::String want;
+    double s = 0.0;
+    if ((url.startsWithIgnoreCase ("http://") || url.startsWithIgnoreCase ("https://")) && sg::range::startFromUrl (url, s))
+        want = sg::range::formatTime (s) + "-";
+
+    if (want == lastAutoWant)
+        return;   // same start time as before: a range the user cleared or edited stays as it is
+    lastAutoWant = want;
+
+    const auto cur = rangeField.getText().trim();
+    if (cur.isEmpty() || cur == autoRangeText)
+    {
+        if (cur != want)
+            rangeField.setText (want, false);
+        autoRangeText = want;
+    }
+}
+
+void SampleGrabberEditor::fillSourceFields()
+{
+    const auto url = processor.getSourceUrl();
+    if (url.isEmpty())
+        return;
+    urlField.setText (url, false);
+    rangeField.setText (processor.getSourceRange(), false);
+    autoRangeText.clear();
+    double s = 0.0;   // the restored range wins over the link's t= on the next URL edit
+    lastAutoWant = sg::range::startFromUrl (url, s) ? sg::range::formatTime (s) + "-" : juce::String();
+    onInputChanged();
+}
+
+bool SampleGrabberEditor::readRangeField (sg::range::Range& out)
+{
+    const auto p = sg::range::parse (rangeField.getText());
+    if (! p.ok)
+    {
+        showStatusError (p.error);
+        return false;
+    }
+    out = p.range;
+    return true;
+}
+
+// Length rules: see sg::range::guard (grab, GRAB ALL confirmation, blocked; unknown length of a link -> confirmation)
+void SampleGrabberEditor::checkGuard (const GrabSpec& spec)
+{
+    const auto v = sg::range::guard (spec.range, spec.duration, spec.isUrl);
+    switch (v.kind)
+    {
+        case sg::range::Verdict::Kind::blocked: showStatusError (v.status); return;
+        case sg::range::Verdict::Kind::confirm: setConfirm (spec, v.status); return;
+        case sg::range::Verdict::Kind::grab:    proceedGrab (spec); return;
+    }
+}
+
+void SampleGrabberEditor::proceedGrab (const GrabSpec& spec)
+{
+    if (busy || downloader.isBusy())
+        return;
+
+    clearConfirm();
+    grabNote.clear();
+    if (spec.duration < 0.0 && ! (spec.range.set && spec.range.hasEnd()))
+        grabNote = "LENGTH UNKNOWN";
+    const auto rangeText = sg::range::toText (spec.range);
+
+    if (spec.isUrl)
+    {
+        pendingGrabUrl = spec.url;
+        pendingGrabRange = rangeText;
+        beginBusy (spec.range.set ? "DOWNLOADING RANGE" : "STARTING");
+        downloader.grab (spec.url, spec.range, spec.duration, ! sg::storage::getKeepDownloads(), progressCallback(), doneCallback());
+        updateFetchLabel();
+        return;
+    }
+
+    if (spec.native && ! spec.range.set && spec.channels <= 2)
+    {
+        grabNote.clear();
+        loadFromFile (spec.file);   // directly, as before (no copy, no ffmpeg)
+        return;
+    }
+
+    // Conversion and/or cut via ffmpeg into the cache; the original path is kept as the source (RE-GRAB, state)
+    pendingGrabUrl = spec.file.getFullPathName();
+    pendingGrabRange = rangeText;
+    beginBusy ("CONVERTING");
+    downloader.importFile (spec.file, spec.range, spec.native ? spec.bits : 16, progressCallback(), doneCallback());
+    updateFetchLabel();
 }
 
 namespace
@@ -537,9 +853,18 @@ void SampleGrabberEditor::startGrab()
 
     if (text.startsWithIgnoreCase ("http://") || text.startsWithIgnoreCase ("https://"))
     {
-        pendingGrabUrl = text;
-        beginBusy ("STARTING");
-        downloader.grab (text, progressCallback(), doneCallback());
+        GrabSpec spec;
+        spec.isUrl = true;
+        spec.url = text;
+        spec.inputSerial = inputSerial;
+        if (! readRangeField (spec.range))
+            return;
+        grabNote.clear();
+        beginBusy ("CHECKING LINK");   // progress 0 -> running stripe
+        downloader.probe (text, probeCallback (spec));
+        probing = true;
+        probeStartMs = juce::Time::getMillisecondCounter();
+        updateFetchLabel();
         return;
     }
 
@@ -569,9 +894,10 @@ void SampleGrabberEditor::startGrab()
     }
 }
 
-void SampleGrabberEditor::loadFromFile (const juce::File& f, const juce::String& sourceUrl)
+bool SampleGrabberEditor::loadFromFile (const juce::File& f, const juce::String& sourceUrl, const juce::String& sourceRange)
 {
-    if (processor.loadSample (f, true, sourceUrl))
+    const bool ok = processor.loadSample (f, true, sourceUrl, sourceRange);
+    if (ok)
     {
         waveform.resetView();
         pads.refreshThumbs();
@@ -586,6 +912,7 @@ void SampleGrabberEditor::loadFromFile (const juce::File& f, const juce::String&
         progress = 0.0f;
     }
     repaint();
+    return ok;
 }
 
 void SampleGrabberEditor::syncSliceModeButtons()
@@ -620,13 +947,14 @@ void SampleGrabberEditor::applyRestoredState()
         isError = ! processor.hasSample();
         progress = 0.0f;
         if (url.isNotEmpty())
-            urlField.setText (url, false);   // GRAB fetches the source again
+            fillSourceFields();   // GRAB fetches the same source (and range) again
     }
     else if (processor.hasSample())
     {
         statusText = "READY" + kDot + prettyName (processor.getLoadedFile());
         isError = false;
         progress = 1.0f;
+        fillSourceFields();
     }
     repaint();
 }
@@ -642,6 +970,7 @@ void SampleGrabberEditor::goBack()
     waveform.resetView();
     pads.refreshThumbs();
     syncSliceModeButtons();
+    fillSourceFields();   // link + range of the sample BACK returned to (RE-GRAB fetches that one)
     statusText = "READY" + kDot + prettyName (processor.getLoadedFile());
     isError = false;
     progress = 1.0f;
@@ -712,26 +1041,41 @@ void SampleGrabberEditor::filesDropped (const juce::StringArray& files, int, int
             break;
 }
 
+// Local path or dropped file: the range field applies here too. Length first (header or ffprobe), then the guard.
+// The user's file is only read; conversions and cuts go to the cache.
 bool SampleGrabberEditor::openLocalFile (const juce::File& f)
 {
-    if (isNative (f))
-    {
-        loadFromFile (f);
+    const bool native = isNative (f);
+    if (! native && ! isConvert (f))
+        return false;
+    if (busy || downloader.isBusy())
         return true;
-    }
 
-    if (isConvert (f))
+    GrabSpec spec;
+    spec.file = f;
+    spec.native = native;
+    spec.inputSerial = inputSerial;
+    if (! readRangeField (spec.range))
+        return true;
+
+    grabNote.clear();
+    if (native)
     {
-        if (! downloader.isBusy())
+        if (! readNativeInfo (f, spec.duration, spec.bits, spec.channels))
         {
-            pendingGrabUrl.clear();
-            beginBusy ("CONVERTING");
-            downloader.importFile (f, progressCallback(), doneCallback());
+            showToolError ("COULD NOT READ FILE");
+            return true;
         }
+        checkGuard (spec);
         return true;
     }
 
-    return false;
+    beginBusy ("CHECKING FILE");
+    downloader.probeFile (f, probeCallback (spec));
+    probing = true;
+    probeStartMs = juce::Time::getMillisecondCounter();
+    updateFetchLabel();
+    return true;
 }
 
 //==============================================================================
@@ -760,6 +1104,28 @@ void SampleGrabberEditor::timerCallback()
     // Indeterminate progress: only the bar stripe, only while busy
     if (busy)
         repaint (progR.withHeight (2));
+
+    // Length check hangs (network): yt-dlp has --socket-timeout 15, this is the hard limit
+    if (probing && juce::Time::getMillisecondCounter() - probeStartMs > 45000)
+        cancelJob ("LINK CHECK TIMED OUT - TRY AGAIN", true);
+
+    // GRAB / GRAB ALL / CANCEL / INSTALL TOOLS (job state can change without a callback, e.g. thread winding down)
+    updateFetchLabel();
+
+    // KEEP DOWNLOADS off: delete the cache file once the project can carry the selection without it
+    if (pendingDelete != juce::File() && processor.isEmbedSettled())
+    {
+        const auto f = std::exchange (pendingDelete, juce::File());
+        if (sg::storage::deleteCacheSource (f))
+        {
+            processor.noteSourceNotKept (f);
+            if (! busy && ! isError && statusText.startsWith ("READY"))
+            {
+                statusText << kDot << "DOWNLOAD NOT KEPT";
+                repaint (progR);
+            }
+        }
+    }
 
     // Redraw pads only when the active pad changes (not continuously at 30 Hz)
     const int activePadNow = processor.getActivePad();
@@ -964,7 +1330,9 @@ void SampleGrabberEditor::resized()
     }
 
     auto ur = urlR.reduced (1);
-    fetchButton.setBounds (ur.removeFromRight (fetchButton.getButtonText() == "GRAB" ? 90 : 124));   // INSTALL TOOLS needs more room (Classic font)
+    fetchButton.setBounds (ur.removeFromRight (fetchButton.getButtonText() == "INSTALL TOOLS" ? 124 : 90));   // INSTALL TOOLS needs more room (Classic font)
+    rangeR = ur.removeFromRight (176);
+    rangeField.setBounds (rangeR.withTrimmedLeft (12 + 44).withTrimmedRight (10).reduced (0, 6));
     urlField.setBounds (ur.reduced (12, 6));
 }
 
@@ -1069,8 +1437,14 @@ void SampleGrabberEditor::paint (juce::Graphics& g)
     // --- URL field: fill surface1, border hairline, hairlineStrong on focus ---
     g.setColour (ui::c().surface1);
     g.fillRect (urlR);
-    g.setColour (urlField.hasKeyboardFocus (true) ? ui::c().hairlineStrong : ui::c().hairline);
+    g.setColour (urlField.hasKeyboardFocus (true) || rangeField.hasKeyboardFocus (true) ? ui::c().hairlineStrong : ui::c().hairline);
     g.drawRect (urlR, 1);
+    // Range box: divider on the left, small label in front of the field
+    g.setColour (ui::c().hairline);
+    g.fillRect (rangeR.getX(), urlR.getY() + 1, 1, urlR.getHeight() - 2);
+    g.setColour (ui::c().textSecondary);
+    g.setFont (ui::label (10.0f));
+    g.drawText ("RANGE", rangeR.withTrimmedLeft (12).withWidth (44), juce::Justification::centredLeft);
 
     // --- Status / progress ---
     {
@@ -1100,7 +1474,7 @@ void SampleGrabberEditor::paint (juce::Graphics& g)
 
         const auto textR = progR.withTrimmedTop (6);
         // "Tools missing" hint is a call to action: primary colour instead of dimmed
-        const bool callToAction = ! busy && ! isError && processor.tools->needsInstall();
+        const bool callToAction = ! busy && ! isError && (processor.tools->needsInstall() || confirmPending);
         g.setFont (ui::monoUi (10.0f));
         g.setColour (isError ? ui::c().red : (callToAction ? ui::c().textPrimary : ui::c().textSecondary));
         g.drawText (statusText, textR.withTrimmedRight (50), juce::Justification::centredLeft);

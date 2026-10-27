@@ -104,6 +104,17 @@ public:
         clean7Button.onClick   = [setClean] { setClean (sg::storage::AutoClean::days7); };
         cleanMaxButton.onClick = [setClean] { setClean (sg::storage::AutoClean::maxSize); };
 
+        // KEEP DOWNLOADS: ON = cache keeps grabbed/converted files; OFF = deleted once loaded into RAM
+        keepButton.setClickingTogglesState (true);
+        keepButton.getProperties().set ("outline", true);
+        keepButton.onClick = [this]
+        {
+            sg::storage::setKeepDownloads (keepButton.getToggleState());
+            keepButton.setButtonText (keepText());
+            repaint (keepR);
+        };
+        addAndMakeVisible (keepButton);
+
         audioButton.onClick = [this]
         {
             if (onClose) onClose();
@@ -131,6 +142,8 @@ public:
         audioButton.setVisible (hasAudio);
         autoButton.setToggleState (ToolManager::isAutoUpdateYtDlp(), juce::dontSendNotification);
         autoButton.setButtonText (autoText());
+        keepButton.setToggleState (sg::storage::getKeepDownloads(), juce::dontSendNotification);
+        keepButton.setButtonText (keepText());
         localNote.clear();
         storageNote.clear();
         disarmClear();
@@ -156,7 +169,7 @@ public:
         const int h = 16 + 24 + 12                         // top margin, title
                     + 16 + 6 + 22 + 20                     // APPEARANCE
                     + 16 + 6 + 3 * rowH + 8 + 22 + 6 + 16 + 8 + 22 + 20   // TOOLS
-                    + 16 + 6 + 3 * 22 + 2 * 6 + 20         // STORAGE
+                    + 16 + 6 + 4 * 22 + 3 * 6 + 20         // STORAGE
                     + (hasAudio ? 16 + 6 + 22 + 20 : 0)    // AUDIO
                     + 16 + 16;                             // licence note, bottom margin
         panelR = getLocalBounds().withSizeKeepingCentre (w, h);
@@ -209,6 +222,13 @@ public:
             cr.removeFromLeft (4);
             cleanMaxButton.setBounds (cr.removeFromLeft (80));
             cleanNoteR = cr.withTrimmedLeft (12);
+        }
+        r.removeFromTop (6);
+        keepR = r.removeFromTop (22);
+        {
+            auto kr = keepR.withTrimmedLeft (labelW);
+            keepButton.setBounds (kr.removeFromLeft (148));
+            keepNoteR = kr.withTrimmedLeft (12);
         }
         r.removeFromTop (6);
         exportR = r.removeFromTop (22);
@@ -386,6 +406,11 @@ private:
         repaint();
     }
 
+    juce::String keepText() const
+    {
+        return juce::String ("KEEP: ") + (keepButton.getToggleState() ? "ON" : "OFF");
+    }
+
     juce::String autoText() const
     {
         return juce::String ("AUTO-UPDATE YT-DLP: ") + (autoButton.getToggleState() ? "ON" : "OFF");
@@ -438,6 +463,13 @@ private:
                                                    : "NOTHING IS DELETED AUTOMATICALLY";
         g.setFont (ui::monoUi (10.0f));
         g.drawFittedText (note, cleanNoteR, juce::Justification::centredLeft, 1, 1.0f);
+
+        g.setFont (ui::label (10.0f));
+        g.drawText ("DOWNLOADS", keepR.withWidth (labelW), juce::Justification::centredLeft);
+        g.setFont (ui::monoUi (10.0f));
+        g.drawFittedText (keepButton.getToggleState() ? "GRABS AND CONVERSIONS STAY IN THE CACHE"
+                                                      : "DELETED AFTER LOADING, PROJECTS KEEP SELECTION + LINK",
+                          keepNoteR, juce::Justification::centredLeft, 1, 1.0f);
     }
 
     void paintTools (juce::Graphics& g)
@@ -572,6 +604,7 @@ private:
     juce::TextButton audioButton { "AUDIO / MIDI SETUP" };
     juce::TextButton cacheOpenButton { "OPEN" }, cacheClearButton { "CLEAR NOW" }, exportOpenButton { "OPEN" };
     juce::TextButton cleanOffButton { "OFF" }, clean7Button { "7 DAYS" }, cleanMaxButton { "1 GB MAX" };
+    juce::TextButton keepButton { "KEEP: ON" };
     juce::String storageNote;                       // OPEN fallback note in the STORAGE section
     bool clearArmed = false;                        // CLEAR NOW clicked once, waiting for the confirm click
     int clearToken = 0;                             // invalidates pending disarm timers
@@ -580,7 +613,7 @@ private:
     juce::String localNote;                         // note from the overlay itself (OPEN), until the next tool event
     std::unique_ptr<juce::ChildProcess> opener;     // xdg-open; object stays until the next click (no kill)
     juce::Rectangle<int> panelR, titleR, appLabelR, toolsLabelR, rowsR, toolStatusR, lastCheckR, folderR, audioLabelR, footerR;
-    juce::Rectangle<int> storageLabelR, cacheR, cacheSizeR, cleanR, cleanNoteR, exportR;
+    juce::Rectangle<int> storageLabelR, cacheR, cacheSizeR, cleanR, cleanNoteR, keepR, keepNoteR, exportR;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SettingsOverlay)
 };

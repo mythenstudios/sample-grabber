@@ -109,8 +109,12 @@ public:
 
     // ---- Message-Thread-API (UI) ----
     // recordHistory = true: the previous state (sample, trim, slice mode, tempo octave) is pushed onto the BACK stack.
-    // sourceUrl: link the file was grabbed from (saved in the plugin state for re-grabbing), empty for local files.
-    bool loadSample (const juce::File& file, bool recordHistory = true, const juce::String& sourceUrl = {});
+    // sourceUrl: link the file was grabbed from (saved in the plugin state for re-grabbing); for a converted/cut local file
+    // the original path (the URL field accepts paths); empty for a local file loaded directly.
+    // sourceRange: normalised range text (sg::range::toText) the file covers, empty = whole source.
+    // After a restore with a missing source, loading the same link + range again restores the saved trim if the length fits.
+    bool loadSample (const juce::File& file, bool recordHistory = true, const juce::String& sourceUrl = {},
+                     const juce::String& sourceRange = {});
 
     // BACK: return to the state before the last load without re-fetching (message thread).
     // The stack lives in RAM only (not in plugin state): at most maxHistoryDepth levels, oldest are dropped first.
@@ -184,7 +188,15 @@ public:
     // Plugin state restore (setStateInformation) -> editor refresh: bumped after every restore (message thread)
     int getStateVersion() const { return stateVersion.load(); }
     juce::String getRestoreNote() const;     // e.g. "SOURCE MISSING - USING SAVED SELECTION", empty = normal
-    juce::String getSourceUrl() const;       // link of the loaded sample, empty for local files
+    juce::String getSourceUrl() const;       // link (or original path) of the loaded sample, empty for local files loaded directly
+    juce::String getSourceRange() const;     // range text of the loaded sample (e.g. "1:02:00-1:05:30"), empty = whole source
+
+    // KEEP DOWNLOADS off (message thread): true once the worker has handled the embedded FLAC for the current selection
+    // (encoded, or skipped because it is too long/large - then the editor shows its note). Only then the cache file may go.
+    bool isEmbedSettled() const;
+    // The cache file f was deleted on purpose (KEEP DOWNLOADS off): saved in the state, restore then says so instead of
+    // "SOURCE MISSING". Applies to the loaded sample and BACK entries with that file. Message thread.
+    void noteSourceNotKept (const juce::File& f);
 
     // Self tests (SG_STATE_SELFTEST / SG_EXPORT_SELFTEST): wait until the background worker has nothing left to do
     bool waitForBackgroundIdle (int timeoutMs);
@@ -246,7 +258,9 @@ private:
     // State restore, applied on the message thread
     struct RestoreInfo
     {
-        juce::String path, url;
+        juce::String path, url, range;
+        double sourceSeconds = -1.0;                     // length of the original source, < 0 = unknown (older projects)
+        bool sourceKept = true;                          // false = source deleted on purpose (KEEP DOWNLOADS off)
         float trimStart = 0.0f, trimEnd = 1.0f;
         int sliceMode = (int) SliceMode::transient;
         float bpm = 0.0f;
@@ -258,8 +272,10 @@ private:
     void applyRestore (const RestoreInfo&);
     void applyPendingRestore();   // message thread: applies pendingRestore (newest wins), then clears it
     bool installFromReader (juce::AudioFormatReader& reader, const juce::File& file, bool recordHistory, const juce::String& url,
-                            bool embedded = false, float embTrimStart = 0.0f, float embTrimEnd = 1.0f);
-    void setMeta (const juce::File& file, const juce::String& url, bool embedded, float embTrimStart, float embTrimEnd);
+                            const juce::String& range, bool embedded = false, float embTrimStart = 0.0f, float embTrimEnd = 1.0f,
+                            double sourceSeconds = -1.0);
+    void setMeta (const juce::File& file, const juce::String& url, const juce::String& range, bool embedded,
+                  float embTrimStart, float embTrimEnd, double sourceSeconds);
     void seedEmbedded (std::shared_ptr<const juce::MemoryBlock> flac);   // restored FLAC = whole current selection
     void updateInUse();   // in-use registry for cache cleaning (loaded file + BACK history), message thread
 
@@ -287,7 +303,9 @@ private:
         std::shared_ptr<juce::AudioBuffer<float>> sample;   // shared pointer, no copy of the buffer
         std::vector<float> flux;
         juce::File file;
-        juce::String url;
+        juce::String url, range;
+        double sourceSeconds = -1.0;
+        bool sourceKept = true;
         bool embedded = false;                              // sample = embedded selection, file is the missing original
         float embTrimStart = 0.0f, embTrimEnd = 1.0f;
         double sampleRate = 44100.0;
@@ -343,10 +361,23 @@ private:
     juce::String metaPath;          // path written to the state (original file, also when it is missing)
     juce::String metaTitle;         // export folder/file title
     juce::String metaUrl;           // link the sample was grabbed from
+    juce::String metaRange;         // range text of the source section, empty = whole source
+    double metaSourceSeconds = -1.0;   // length of the original source in seconds (< 0 = unknown)
+    bool metaSourceKept = true;        // false = source file deleted on purpose (KEEP DOWNLOADS off)
     juce::String restoreNote;
     bool embeddedMode = false;      // sample is the embedded selection of a missing source
     float embOrigTrimStart = 0.0f, embOrigTrimEnd = 1.0f;   // embedded audio = this range of the original (normalised)
     std::shared_ptr<const RestoreInfo> pendingRestore;       // set by setStateInformation until applyRestore ran
+
+    // Restored with a missing source: trim to re-apply when the same link + range is grabbed again (message thread only)
+    struct RegrabTrim
+    {
+        bool valid = false;
+        juce::String url, range;
+        float trimStart = 0.0f, trimEnd = 1.0f;   // original coordinates
+        double sourceSeconds = -1.0;
+    };
+    RegrabTrim regrabTrim;
     std::shared_ptr<const juce::MemoryBlock> embeddedFlac;   // cached FLAC of the current selection (worker encodes)
     juce::uint64 embeddedFlacKey = 0;                        // computeEmbedKey() it belongs to
     int embeddedFlacSerial = -1;                             // sampleSerial it was encoded from

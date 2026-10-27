@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
+#include "TimeRange.h"
 #include <atomic>
 
 // Storage layout (never used on the audio thread):
@@ -37,6 +38,11 @@ namespace sg::storage
     // Title of a source file: our own export suffix ("_pad05_<hash>", "_sel_<hash>") removed, the yt-dlp id suffix
     // ("_<11 chars>") only for files in our downloads folder
     juce::String titleFromFile (const juce::File&);
+    // true for files directly in our downloads/ or imports/ folder (also the pre-cache locations)
+    bool isCacheSource (const juce::File&);
+    // File name without extension; for cache sources the range tag "_r<from>-<to>" (sg::range::fileTag) is removed
+    // and returned in rangeOut (unset if there is none). Other files: name unchanged, no range.
+    juce::String stripRangeTag (const juce::File&, sg::range::Range* rangeOut = nullptr);
 
     // Make dst a complete, independent copy of src (copy, never a hard link: destructive edits in a DAW must not change
     // the staging file). Written to a temp file and renamed only if dst is still absent; an existing dst is kept.
@@ -55,6 +61,31 @@ namespace sg::storage
     constexpr juce::int64 maxCacheBytes = (juce::int64) 1024 * 1024 * 1024;   // 1 GB MAX
     AutoClean getAutoClean();          // settings.xml key "autoClean", default maxSize
     void setAutoClean (AutoClean);
+
+    // KEEP DOWNLOADS (settings.xml key "keepDownloads", default on). Off: a grab/import result in our cache is deleted
+    // once it has been loaded into RAM (the plugin state then relies on the embedded selection + link).
+    bool getKeepDownloads();
+    void setKeepDownloads (bool);
+    // Deletes f only if it is a cache source (downloads/imports) under a safe, marked cache root. Message thread.
+    bool deleteCacheSource (const juce::File& f);
+
+    // Video ids from yt-dlp probes (any thread). Only ids matching [A-Za-z0-9_-]{6,} are used for file matching.
+    bool isValidVideoId (const juce::String&);
+    void rememberVideoId (const juce::String& url, const juce::String& id);   // per process, small (oldest dropped)
+    juce::String videoIdFor (const juce::String& url);
+    // Whole-audio downloads in flight, per video id, process-wide: a second job for the same id waits, then reuses the file
+    bool tryBeginFetch (const juce::String& id);
+    void endFetch (const juce::String& id);
+    // Name parts of files a running job of this process writes (e.g. "_<id>." for yt-dlp outputs, the cut's file name)
+    void setJobFiles (const void* owner, const juce::StringArray& nameParts);
+    // true if f is being written: yt-dlp/ffmpeg intermediate (.part, .temp., .ytdl, .tmp), a file of a running job or
+    // in-flight video id of this process. CLEAR NOW keeps these (plus anything modified in the last 5 s).
+    bool isBeingWritten (const juce::File& f);
+
+    // Probe info JSONs (cacheRoot/tmp/probe-*.info.json): the cleaner keeps them 15 min, the startup sweep removes
+    // those older than 10 min (stream URLs in them have expired by then)
+    bool isProbeJson (const juce::File&);
+    void sweepProbeJsons (const juce::File& root, juce::int64 maxAgeMs);
 
     juce::String formatBytes (juce::int64);
 }
@@ -77,7 +108,7 @@ public:
     bool isBusy() const noexcept         { return busy.load(); }
     juce::String getLastNote() const;
 
-    struct CleanResult { int deleted = 0, kept = 0; juce::int64 freed = 0; };
+    struct CleanResult { int deleted = 0, kept = 0, keptInUse = 0, keptBusy = 0; juce::int64 freed = 0; };
     // Blocking (worker thread or self test). clearAll = CLEAR NOW (mode ignored).
     static CleanResult clean (const juce::File& root, sg::storage::AutoClean mode, bool clearAll);
     static juce::int64 computeSize (const juce::File& root);
