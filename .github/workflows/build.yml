@@ -1,0 +1,67 @@
+name: build
+
+on:
+  push:
+    branches: [main, "win/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the running build
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    # Pinned: windows-latest moved to Visual Studio 2026, JUCE 8.0.4 is only known to build with VS 2022
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --target SampleGrabber SampleGrabberApp --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $out = "dist/sample-grabber-$sha-windows-x64"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item -Recurse "build/SampleGrabber_artefacts/Release/VST3/Sample Grabber.vst3" $out
+          Copy-Item "build/SampleGrabberApp_artefacts/Release/Sample Grabber.exe" $out
+          Copy-Item LICENSE $out
+          Get-ChildItem -Recurse $out | Select-Object FullName, Length | Format-Table -AutoSize
+          "PKG=$out" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sample-grabber-windows-x64
+          path: ${{ env.PKG }}
+          retention-days: 7
+
+  # Cross-check: Windows changes must not break the Linux build
+  linux-x64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            libasound2-dev libjack-jackd2-dev libfreetype-dev libfontconfig1-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev \
+            libxrandr-dev libxrender-dev libglu1-mesa-dev mesa-common-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --target SampleGrabber SampleGrabberApp
