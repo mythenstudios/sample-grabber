@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Sample Grabber
+GenericName=Sampler
+Comment=Grab audio from a link or file, slice it into 16 pads, drag samples into your DAW
+Exec="@BIN@"
+Icon=sample-grabber
+Terminal=false
+# Must match the X11 WM_CLASS (JUCEApplication::getApplicationName) so the dock shows this entry's icon
+StartupWMClass=Sample Grabber
+Categories=AudioVideo;Audio;Music;
+Keywords=sample;slice;audio;music;

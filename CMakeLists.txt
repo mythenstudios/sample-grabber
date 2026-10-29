@@ -66,7 +66,8 @@ set(SG_SOURCES
 # SVGs always; fonts only if all four files exist (otherwise default font, SG_HAS_BRAND_FONTS=0).
 set(SG_BRAND_SOURCES
     brand/lockup/lockup-horizontal-dark.svg
-    brand/lockup/lockup-horizontal-light.svg)
+    brand/lockup/lockup-horizontal-light.svg
+    brand/icon/icon-256.png)
 
 set(SG_BRAND_FONTS
     resources/fonts/Inter-Regular.ttf

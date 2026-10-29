@@ -56,3 +56,6 @@ scripts/save-point.sh
 # Brand kit: only what the build and the README need is tracked (added with `git add -f`):
 # lockup dark/light, icon 1024/256, mark dark/light, BrandColours.h
 brand/
+
+# Release packages (scripts/package-linux.sh)
+dist/

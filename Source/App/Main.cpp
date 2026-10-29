@@ -78,6 +78,10 @@ public:
         setResizable (false, false);
         centreWithSize (getWidth(), getHeight());
         setVisible (true);
+
+        // Taskbar/dock icon (X11 _NET_WM_ICON). DocumentWindow::setIcon would only draw into the custom title bar.
+        if (auto* peer = getPeer())
+            peer->setIcon (juce::ImageCache::getFromMemory (BinaryData::icon256_png, BinaryData::icon256_pngSize));
     }
 
     ~MainWindow() override
