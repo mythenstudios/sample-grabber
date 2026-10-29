@@ -70,7 +70,13 @@ namespace sg::storage
     juce::File cacheRoot()
     {
         const auto env = envDir ("SG_CACHE_DIR");
-        return env != juce::File() ? env : appDataDir().getChildFile ("cache");
+       #if JUCE_WINDOWS
+        // Large downloads must not roam: Local AppData (settings.xml/audio.xml stay in Roaming via appDataDir())
+        const auto defaultRoot = juce::File::getSpecialLocation (juce::File::windowsLocalAppData).getChildFile ("SampleGrabber").getChildFile ("cache");
+       #else
+        const auto defaultRoot = appDataDir().getChildFile ("cache");
+       #endif
+        return env != juce::File() ? env : defaultRoot;
     }
 
     juce::File cacheSubdir (const juce::String& sub)
@@ -135,7 +141,12 @@ namespace sg::storage
             whyNot = "home folder";
         else if (same (root, music))
             whyNot = "music folder";
-        else if (same (root, appDataDir()) || same (root, juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)))
+        else if (same (root, appDataDir()) || same (root, juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory))
+                #if JUCE_WINDOWS
+                 || same (root, juce::File::getSpecialLocation (juce::File::windowsLocalAppData))
+                 || same (root, juce::File::getSpecialLocation (juce::File::windowsLocalAppData).getChildFile ("SampleGrabber"))
+                #endif
+                 )
             whyNot = "user data folder";
         else if (same (root, exp) || exp.isAChildOf (root))
             whyNot = "export folder or its parent";

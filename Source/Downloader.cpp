@@ -247,7 +247,7 @@ void Downloader::cancel()
            #if JUCE_LINUX
             killProcessTree (procArgs);
            #endif
-            proc->kill();
+            proc->kill();   // Windows: WinProcess terminates its Job Object, i.e. the whole tree
         }
     }
     stopThread (3000);
@@ -286,7 +286,7 @@ bool Downloader::startProcess (const juce::StringArray& args)
     const juce::ScopedLock sl (procLock);
     if (threadShouldExit())
         return false;   // cancelled: cancel() holds procLock while killing, so nothing starts after it
-    proc = std::make_unique<juce::ChildProcess>();
+    proc = std::make_unique<Process>();
     procArgs = args;
     return proc->start (args, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr);
 }
@@ -423,6 +423,11 @@ void Downloader::runDownload (Result& r)
             "--postprocessor-args", juce::String ("ExtractAudio:-af ") + channelFilter + (ownFfmpeg() ? " -rf64 auto" : "")
         };
 
+       #if JUCE_WINDOWS
+        // Printed lines (filepath, errors) as UTF-8 instead of the ANSI codepage (WinProcess also sets PYTHONUTF8)
+        args.addArray ({ "--encoding", "utf-8" });
+       #endif
+
         if (ytRange.set)
             args.addArray ({ "--download-sections",
                              "*" + sg::range::toolSeconds (ytRange.from) + "-"
@@ -445,7 +450,8 @@ void Downloader::runDownload (Result& r)
         }
 
         const float scale = cutLocally ? 0.85f : 0.9f;
-        juce::String pending, lastLine;
+        std::string pending;   // raw bytes: a read may end inside a multi-byte UTF-8 character, decode whole lines only
+        juce::String lastLine;
         int lastPct = -1;
         char buf[1024];
 
@@ -455,13 +461,13 @@ void Downloader::runDownload (Result& r)
             if (n <= 0)
                 break;
 
-            pending += juce::String::fromUTF8 (buf, n);
+            pending.append (buf, (size_t) n);
 
-            int nl;
-            while ((nl = pending.indexOfAnyOf ("\r\n")) >= 0)
+            size_t nl;
+            while ((nl = pending.find_first_of ("\r\n")) != std::string::npos)
             {
-                const auto line = pending.substring (0, nl).trim();
-                pending = pending.substring (nl + 1);
+                const auto line = juce::String::fromUTF8 (pending.data(), (int) nl).trim();
+                pending.erase (0, nl + 1);
 
                 if (line.isEmpty())
                     continue;
@@ -615,6 +621,9 @@ void Downloader::runProbeUrl (Result& r)
     // -J: the full info JSON (one line). Kept for the grab (--load-info-json skips a second extraction, ~3 s on YouTube).
     juce::StringArray args { ytdlp.getFullPathName(), "--no-playlist", "--no-warnings", "--skip-download",
                              "--socket-timeout", "15", "-J" };
+   #if JUCE_WINDOWS
+    args.addArray ({ "--encoding", "utf-8" });   // see runDownload
+   #endif
     if (ffmpeg != juce::File())
         args.addArray ({ "--ffmpeg-location", ffmpeg.getParentDirectory().getFullPathName() });
     if (deno != juce::File())

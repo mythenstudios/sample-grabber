@@ -622,6 +622,24 @@ namespace selftest
                         log ("still running: " + d.getFileName() + " " + cmd.substring (0, 100));
                     }
                 }
+           #elif JUCE_WINDOWS
+            // No other process' command line without reading its PEB: match by image instead (yt-dlp.exe, its
+            // PyInstaller child of the same name, ffmpeg/ffprobe, deno) in our tools folder or wherever the tools resolve
+            juce::Array<juce::File> dirs { ToolManager::toolsDir() };
+            {
+                juce::SharedResourcePointer<ToolManager> tm;
+                for (const auto t : { ToolManager::Tool::ytdlp, ToolManager::Tool::ffmpeg, ToolManager::Tool::deno })
+                {
+                    const auto exe = tm->getExecutable (t);
+                    if (exe != juce::File())
+                        dirs.addIfNotAlreadyThere (exe.getParentDirectory());
+                }
+            }
+            for (const auto& p : sg::winproc::findProcessesIn (dirs, { "yt-dlp", "ffmpeg", "ffprobe", "deno" }))
+            {
+                ++survivors;
+                log ("still running: " + p);
+            }
            #endif
             const auto left = sg::storage::cacheRoot().getChildFile ("downloads").findChildFiles (juce::File::findFiles, false);
             for (const auto& f : left)

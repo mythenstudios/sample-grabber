@@ -63,6 +63,11 @@ set(SG_SOURCES
     Source/ToolManager.cpp
     Source/Storage.cpp)
 
+# Windows: the Downloader's child processes run in a Job Object (CANCEL kills the whole tree), see WinProcess.h
+if(WIN32)
+    list(APPEND SG_SOURCES Source/WinProcess.cpp)
+endif()
+
 # Brand assets (UI_BRAND.md 1): SVGs and fonts (SIL OFL) as BinaryData, accessed via BinaryData.h.
 # SVGs always; fonts only if all four files exist (otherwise default font, SG_HAS_BRAND_FONTS=0).
 set(SG_BRAND_SOURCES

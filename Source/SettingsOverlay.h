@@ -395,7 +395,14 @@ private:
             repaint();
         }
        #else
-        dir.startAsProcess();
+        // Windows: ShellExecute with the default verb opens the folder itself in Explorer (revealToUser would select it
+        // inside its parent). macOS: opens in Finder.
+        if (! dir.startAsProcess())
+        {
+            juce::SystemClipboard::copyTextToClipboard (dir.getFullPathName());
+            note = "COULD NOT OPEN FOLDER - PATH COPIED";
+            repaint();
+        }
        #endif
     }
 
@@ -422,8 +429,12 @@ private:
     static juce::String shortPath (const juce::File& f)
     {
         auto p = f.getFullPathName();
-       #if ! JUCE_WINDOWS
         const auto home = juce::File::getSpecialLocation (juce::File::userHomeDirectory).getFullPathName();
+       #if JUCE_WINDOWS
+        // Case-insensitive, backslash separator
+        if (home.length() > 1 && (p.equalsIgnoreCase (home) || p.startsWithIgnoreCase (home + "\\")))
+            p = "~" + p.substring (home.length());
+       #else
         if (home.length() > 1 && (p == home || p.startsWith (home + "/")))
             p = "~" + p.substring (home.length());
        #endif
