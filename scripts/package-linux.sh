@@ -9,7 +9,7 @@ BUILD=build
 ART="$BUILD/SampleGrabberApp_artefacts/Release/Sample Grabber"
 VST="$BUILD/SampleGrabber_artefacts/Release/VST3/Sample Grabber.vst3"
 
-cmake --build "$BUILD" --target SampleGrabber SampleGrabberApp
+cmake --build "$BUILD" --target SampleGrabber_VST3 SampleGrabberApp
 
 VERSION=$(sed -n 's/^project(SampleGrabber VERSION \([0-9.]*\)).*/\1/p' CMakeLists.txt)
 COMMIT=$(git rev-parse --short HEAD)
