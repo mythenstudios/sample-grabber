@@ -11,6 +11,7 @@
 
 class SampleGrabberEditor : public juce::AudioProcessorEditor,
                             public juce::FileDragAndDropTarget,
+                            public juce::TextDragAndDropTarget,
                             private juce::Timer,
                             private juce::ChangeListener
 {
@@ -29,6 +30,10 @@ public:
     void fileDragEnter (const juce::StringArray&, int, int) override;
     void fileDragExit (const juce::StringArray&) override;
     void filesDropped (const juce::StringArray&, int, int) override;
+    bool isInterestedInTextDrag (const juce::String&) override;
+    void textDragEnter (const juce::String&, int, int) override;
+    void textDragExit (const juce::String&) override;
+    void textDropped (const juce::String&, int, int) override;
 
 private:
     void timerCallback() override;

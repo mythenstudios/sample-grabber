@@ -986,7 +986,14 @@ void SampleGrabberEditor::dragOut (int pad)
     const auto f = processor.prepareDragFile (pad);
     if (f.existsAsFile())
     {
-        juce::DragAndDropContainer::performExternalDragDropOfFiles (juce::StringArray (f.getFullPathName()), false, this);
+       #if JUCE_LINUX
+        // JUCE writes plain paths into the XDND uri-list as "file://" + path without percent-encoding;
+        // strict targets (Reaper) reject paths with spaces. Strings that already look like URLs are passed through as-is.
+        const auto dragItem = juce::URL (f).toString (false);
+       #else
+        const auto dragItem = f.getFullPathName();
+       #endif
+        juce::DragAndDropContainer::performExternalDragDropOfFiles (juce::StringArray (dragItem), false, this);
     }
     else
     {
@@ -1003,13 +1010,24 @@ bool SampleGrabberEditor::isInterestedInFileDrag (const juce::StringArray& files
     if (settings.isVisible())
         return false;   // overlay open: no drop underneath
 
+    bool ok = false;
     for (const auto& path : files)
     {
         const juce::File f (path);
         if (isNative (f) || isConvert (f))
-            return true;
+            ok = true;
     }
-    return false;
+
+    // Called on every drag move: log only when the offered list changes
+    static juce::String lastLogged;
+    const auto joined = files.joinIntoString ("|");
+    if (joined != lastLogged)
+    {
+        lastLogged = joined;
+        std::fprintf (stderr, "[SG] drop in: %d file(s), %s, first '%s'\n", files.size(), ok ? "accepted" : "rejected",
+                      files[0].toRawUTF8());
+    }
+    return ok;
 }
 
 void SampleGrabberEditor::fileDragEnter (const juce::StringArray&, int, int)
@@ -1040,6 +1058,38 @@ void SampleGrabberEditor::filesDropped (const juce::StringArray& files, int, int
         if (openLocalFile (juce::File (path)))
             break;
 }
+
+// Some XDND sources (e.g. XWayland bridges) offer text/plain before text/uri-list; JUCE then delivers
+// the uri-list as text. Turn "file://" lines and absolute paths back into file paths.
+static juce::StringArray filesFromDragText (const juce::String& text)
+{
+    juce::StringArray out;
+    for (auto line : juce::StringArray::fromLines (text))
+    {
+        line = line.trim();
+        if (line.startsWithIgnoreCase ("file://"))
+            out.add (juce::URL::removeEscapeChars (line.replace ("+", "%2B").substring (7)));
+        else if (line.startsWithChar ('/'))
+            out.add (line);
+    }
+    return out;
+}
+
+bool SampleGrabberEditor::isInterestedInTextDrag (const juce::String& text)
+{
+    const auto files = filesFromDragText (text);
+    static juce::String lastLogged;
+    if (text != lastLogged)
+    {
+        lastLogged = text;
+        std::fprintf (stderr, "[SG] drop in as text: '%s' -> %d path(s)\n", text.substring (0, 200).toRawUTF8(), files.size());
+    }
+    return ! files.isEmpty() && isInterestedInFileDrag (files);
+}
+
+void SampleGrabberEditor::textDragEnter (const juce::String& text, int x, int y)  { fileDragEnter (filesFromDragText (text), x, y); }
+void SampleGrabberEditor::textDragExit (const juce::String& text)                 { fileDragExit (filesFromDragText (text)); }
+void SampleGrabberEditor::textDropped (const juce::String& text, int x, int y)    { filesDropped (filesFromDragText (text), x, y); }
 
 // Local path or dropped file: the range field applies here too. Length first (header or ffprobe), then the guard.
 // The user's file is only read; conversions and cuts go to the cache.

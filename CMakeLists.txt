@@ -26,6 +26,29 @@ FetchContent_Declare(signalsmith-stretch
 
 FetchContent_MakeAvailable(JUCE signalsmith-linear signalsmith-stretch)
 
+# JUCE 8.0.4 Linux drop target: rejects XdndEnter with version > 3, but Mutter's XWayland bridge (GNOME on Wayland)
+# always sends version 5 without reading XdndAware -> file drops from Wayland apps never arrive. XDND 4/5 only add
+# source-side features, so a v3 target can accept them. Also report "accepted + copy" in XdndFinished (v5 fields).
+# Idempotent: rewrites the fetched source in place; warns if a JUCE update changed the code.
+set(SG_JUCE_DND "${juce_SOURCE_DIR}/modules/juce_gui_basics/native/juce_DragAndDrop_linux.cpp")
+file(READ "${SG_JUCE_DND}" SG_DND_SRC)
+set(SG_DND_OLD_VERSION "if (dndCurrentVersion < 3 || dndCurrentVersion > XWindowSystemUtilities::Atoms::DndVersion)")
+set(SG_DND_NEW_VERSION "if (dndCurrentVersion < 3) // SG patch: accept XDND 4/5")
+set(SG_DND_OLD_FINISH  "msg.message_type = getAtoms().XdndFinished;\n")
+set(SG_DND_NEW_FINISH  "msg.message_type = getAtoms().XdndFinished;\n        msg.data.l[1] = 1; msg.data.l[2] = (long) getAtoms().XdndActionCopy; // SG patch: XDND 5 accepted + action\n")
+if(NOT SG_DND_SRC MATCHES "SG patch: accept XDND")
+    string(FIND "${SG_DND_SRC}" "${SG_DND_OLD_VERSION}" SG_POS_V)
+    string(FIND "${SG_DND_SRC}" "${SG_DND_OLD_FINISH}" SG_POS_F)
+    if(SG_POS_V EQUAL -1 OR SG_POS_F EQUAL -1)
+        message(WARNING "JUCE XDND patch not applied: code changed, check juce_DragAndDrop_linux.cpp")
+    else()
+        string(REPLACE "${SG_DND_OLD_VERSION}" "${SG_DND_NEW_VERSION}" SG_DND_SRC "${SG_DND_SRC}")
+        string(REPLACE "${SG_DND_OLD_FINISH}" "${SG_DND_NEW_FINISH}" SG_DND_SRC "${SG_DND_SRC}")
+        file(WRITE "${SG_JUCE_DND}" "${SG_DND_SRC}")
+        message(STATUS "JUCE XDND patch applied")
+    endif()
+endif()
+
 set(SG_STRETCH_INCLUDES
     ${signalsmith-stretch_SOURCE_DIR}
     ${signalsmith-stretch_SOURCE_DIR}/include
