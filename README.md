@@ -22,12 +22,13 @@
 
 | | |
 |---|---|
-| **Grab** | Paste a YouTube, TikTok, Instagram or Twitch link, or a local file path (WAV, MP3, M4A, Opus, video ...). |
+| **Grab** | Paste a YouTube, TikTok, Instagram or Twitch link, a local file path, or drop a file onto the window (WAV, MP3, M4A, Opus, video ...). Grab only a part with a time range (`1:02-1:30`, or `t=` in the link); long downloads can be cancelled. |
 | **Trim** | Waveform with in/out handles, zoom, loop and instant playback. |
 | **Slice** | Auto-slice the selection across 16 pads: **Grid**, **Beat** or **Transient**. Pads respond to clicks and MIDI notes 36-51. |
 | **Analyse** | BPM and key detection on the whole track or the current selection, with tempo octave `/2` `x2`. |
 | **Shape** | Gain, pitch and speed (independent, applied live), fade in/out with adjustable curve, drawn right in the waveform. |
-| **Drop** | Drag a pad or the whole selection into your DAW as a WAV file. |
+| **Drop** | Drag a pad or the whole selection into your DAW as a WAV file (saved under `~/Music/Sample Grabber`). |
+| **Recall** | The plugin state is saved with your DAW project, including the selected audio - it still plays if the download is gone. |
 | **Tools** | yt-dlp, deno and ffmpeg are installed and kept up to date by the app itself - from their official GitHub releases, SHA-256 verified. No Python, no PATH setup. |
 
 <p align="center">
@@ -42,9 +43,24 @@ Early development. Expect rough edges and breaking changes between commits.
 
 | Platform | State |
 |---|---|
-| Linux x86_64 | Builds and runs (developed on Ubuntu 22.04 / WSL2) |
+| Linux x86_64 | Works. Built on Ubuntu 22.04 (glibc 2.35), tested on Ubuntu 26.04 in Ardour, Reaper and Bitwig |
+| Linux ARM64 | Planned (code prepared, not built yet) |
 | Windows x64 / ARM64 | Planned |
 | macOS (Apple Silicon) | Planned |
+
+Known limitations on Linux: in Bitwig, dropping a file *onto the plugin window* does not reach the plugin
+(Bitwig keeps the drop) - paste the file path into the link field instead. Dragging pads *out* works everywhere.
+
+## Install (Linux)
+
+Download `sample-grabber-<version>-linux-x86_64.tar.gz`, unpack it and run:
+
+```bash
+./install.sh      # VST3 to ~/.vst3, app to ~/.local/bin + app menu entry, no root needed
+./uninstall.sh    # removes it again (add --purge to also delete settings, tools and cache)
+```
+
+Rescan plugins in your DAW if it does not show up. More notes in [`packaging/linux/README.txt`](packaging/linux/README.txt).
 
 ## Build (Linux)
 
@@ -69,6 +85,8 @@ Artefacts:
 On first start the app offers **INSTALL TOOLS** (about 220 MB download: yt-dlp, deno, ffmpeg).
 They go to `~/.config/SampleGrabber/bin` and are managed from the settings (gear icon, top right).
 At runtime Linux needs `curl`, `tar` and `xz`.
+
+`bash scripts/package-linux.sh` builds the release tarball into `dist/`.
 
 Developing in WSL2? `scripts/setup-wsl.sh` installs the build dependencies, `scripts/wsl-audio.sh` routes ALSA to WSLg's PulseAudio.
 
