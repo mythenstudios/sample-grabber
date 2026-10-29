@@ -73,7 +73,9 @@ public:
                 clearArmed = true;
                 cacheClearButton.setButtonText ("CONFIRM CLEAR?");
                 const int token = ++clearToken;
-                juce::Timer::callAfterDelay (3000, [safe = juce::Component::SafePointer<SettingsOverlay> (this), token]
+                // Built outside the capture list: MSVC rejects 'this' in an init-capture of a nested lambda
+                const juce::Component::SafePointer<SettingsOverlay> safe (this);
+                juce::Timer::callAfterDelay (3000, [safe, token]
                 {
                     if (safe != nullptr && safe->clearToken == token)
                         safe->disarmClear();
