@@ -777,6 +777,164 @@ namespace selftest
     };
 }
 
+namespace selftest
+{
+    // SG_PROC_SELFTEST=1 (Windows only, needs SG_CACHE_DIR): argv quoting round trip through CommandLineToArgvW, and
+    // that kill() and destroying a running WinProcess leave no process of its tree behind. The tree is
+    // sgproc-cmd.exe -> sgproc-cmd2.exe -> ping.exe (copies of cmd.exe with unique names in a scratch folder, so
+    // findProcessesIn sees exactly our processes).
+    int runProc()
+    {
+       #if ! JUCE_WINDOWS
+        std::fprintf (stderr, "[SG-PROC] skipped (Windows only)\n");
+        return 0;
+       #else
+        if (! requireScratch())
+            return 1;
+
+        int failures = 0;
+        auto log = [] (const juce::String& s) { std::fprintf (stderr, "[SG-PROC] %s\n", s.toRawUTF8()); };
+        auto expect = [&] (bool ok, const juce::String& what)
+        {
+            log ((ok ? "ok   " : "FAIL ") + what);
+            if (! ok)
+                ++failures;
+        };
+        auto now = [] { return juce::Time::getMillisecondCounterHiRes(); };
+
+        // a) Quoting: every case alone and all together, argv[0] = an exe path (own parsing rules)
+        {
+            const juce::StringArray cases { "a b", "a\"b", "C:\\dir with space\\", "", "\t", "\\\\\"", "trailing\\\\",
+                                            "x", "a\\b", "\\\"", "a\\\\b c", "\"", "tab\tin", "new\nline" };
+            auto visible = [] (const juce::String& s)
+            {
+                return "[" + s.replace ("\t", "<TAB>").replace ("\n", "<LF>") + "]";
+            };
+            auto roundTrip = [&] (const juce::StringArray& args, const juce::String& what)
+            {
+                const auto cmd = sg::WinProcess::quoteCommandLine (args);
+                const auto back = sg::winproc::parseCommandLine (cmd);
+                const bool ok = back == args;
+                expect (ok, "quote " + what + " -> " + visible (cmd));
+                if (! ok)
+                    for (int i = 0; i < juce::jmax (args.size(), back.size()); ++i)
+                        log ("      arg " + juce::String (i) + ": in " + visible (args[i]) + " out " + visible (back[i]));
+            };
+            for (const auto* exe : { "C:\\sg\\tool.exe", "C:\\Program Files\\sg tool\\tool.exe" })
+            {
+                for (const auto& c : cases)
+                    roundTrip (juce::StringArray { juce::String (exe), c }, visible (c));
+                juce::StringArray all { juce::String (exe) };
+                all.addArray (cases);
+                roundTrip (all, "all cases, exe " + visible (exe));
+            }
+        }
+
+        // Scratch copies of cmd.exe (+ their language resources, best effort)
+        const auto sys = juce::File::getSpecialLocation (juce::File::windowsSystemDirectory);
+        const auto scratch = sg::storage::cacheRoot().getChildFile ("proc-selftest");
+        scratch.deleteRecursively();
+        scratch.createDirectory();
+        const juce::StringArray names { "sgproc-cmd", "sgproc-cmd2" };
+        for (const auto& n : names)
+        {
+            const auto copy = scratch.getChildFile (n + ".exe");
+            expect (sys.getChildFile ("cmd.exe").copyFileTo (copy), "copy cmd.exe -> " + copy.getFileName());
+        }
+        // Messages of cmd.exe live in <lang>\cmd.exe.mui, looked up by the image name
+        for (const auto& lang : sys.findChildFiles (juce::File::findDirectories, false, "*", juce::File::FollowSymlinks::no))
+        {
+            const auto mui = lang.getChildFile ("cmd.exe.mui");
+            if (! mui.existsAsFile())
+                continue;
+            const auto dest = scratch.getChildFile (lang.getFileName());
+            dest.createDirectory();
+            for (const auto& n : names)
+                mui.copyFileTo (dest.getChildFile (n + ".exe.mui"));
+        }
+        juce::StringArray treeArgs;
+        treeArgs.add (scratch.getChildFile ("sgproc-cmd.exe").getFullPathName());
+        treeArgs.add ("/c");
+        treeArgs.add (scratch.getChildFile ("sgproc-cmd2.exe").getFullPathName());
+        treeArgs.add ("/c");
+        treeArgs.add (sys.getChildFile ("ping.exe").getFullPathName());
+        treeArgs.addArray (juce::StringArray { "-n", "60", "127.0.0.1" });
+        const juce::Array<juce::File> dirs { scratch };
+        auto running = [&] { return sg::winproc::findProcessesIn (dirs, names); };
+        auto waitUntil = [&] (std::function<bool()> cond, double ms)
+        {
+            const auto end = now() + ms;
+            for (;;)
+            {
+                if (cond())
+                    return true;
+                if (now() >= end)
+                    return false;
+                juce::Thread::sleep (20);
+            }
+        };
+        auto startTree = [&] (sg::WinProcess& p, const char* tag)
+        {
+            const bool started = p.start (treeArgs, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr);
+            expect (started, juce::String (tag) + ": tree started");
+            const bool up = started && waitUntil ([&] { return running().size() == names.size(); }, 5000);
+            for (const auto& r : running())
+                log ("      running: " + r);
+            expect (up, juce::String (tag) + ": both cmd copies run");
+            return up;
+        };
+
+        // b) + d) kill() ends the whole tree before it returns, reading to EOF afterwards does not hang
+        {
+            auto p = std::make_unique<sg::WinProcess>();
+            if (startTree (*p, "kill"))
+            {
+                const auto t = now();
+                p->kill();
+                const auto killMs = now() - t;
+                const auto left = running();
+                for (const auto& r : left)
+                    log ("      still running: " + r);
+                expect (left.isEmpty(), "kill: nothing left right after kill() (" + juce::String (killMs, 0) + " ms)");
+                expect (p->getExitCode() == 1, "kill: exit code 1 (got " + juce::String ((juce::int64) p->getExitCode()) + ")");
+
+                const auto t2 = now();
+                char buf[512];
+                int total = 0;
+                for (;;)
+                {
+                    const int n = p->readProcessOutput (buf, (int) sizeof (buf));
+                    if (n <= 0)
+                        break;
+                    total += n;
+                }
+                const auto readMs = now() - t2;
+                expect (readMs < 1000.0, "kill: read to EOF after kill took " + juce::String (readMs, 0) + " ms ("
+                                             + juce::String (total) + " bytes)");
+            }
+        }
+
+        // c) Destroying the object without kill() (plugin closed mid-download): KILL_ON_JOB_CLOSE ends the tree
+        {
+            auto p = std::make_unique<sg::WinProcess>();
+            if (startTree (*p, "destroy"))
+            {
+                const auto t = now();
+                p.reset();
+                const bool gone = waitUntil ([&] { return running().isEmpty(); }, 2000);
+                for (const auto& r : running())
+                    log ("      still running: " + r);
+                expect (gone, "destroy: nothing left after " + juce::String (now() - t, 0) + " ms");
+            }
+        }
+
+        scratch.deleteRecursively();
+        log (failures == 0 ? "ALL OK" : "FAILURES");
+        return failures == 0 ? 0 : 1;
+       #endif
+    }
+}
+
 class SampleGrabberApp : public juce::JUCEApplication
 {
 public:
@@ -827,6 +985,13 @@ public:
         if (juce::SystemStats::getEnvironmentVariable ("SG_RANGE_SELFTEST", {}).isNotEmpty())
         {
             setApplicationReturnValue (selftest::runRange());
+            quit();
+            return;
+        }
+
+        if (juce::SystemStats::getEnvironmentVariable ("SG_PROC_SELFTEST", {}).isNotEmpty())
+        {
+            setApplicationReturnValue (selftest::runProc());
             quit();
             return;
         }

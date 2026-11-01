@@ -32,7 +32,7 @@ public:
     juce::String readAllProcessOutput();   // until the process ends, decoded as UTF-8
     bool waitForProcessToFinish (int timeoutMs) const;
     juce::uint32 getExitCode() const;      // STILL_ACTIVE (259) while running, 1 after kill()
-    bool kill();                           // whole tree; safe to call from another thread while reading
+    bool kill();                           // whole tree, waits up to 2 s until it is gone; safe from another thread while reading
 
     // Command line for CreateProcessW from argv (exposed for tests)
     static juce::String quoteCommandLine (const juce::StringArray& args);
@@ -49,6 +49,9 @@ namespace winproc
     // "<pid> <image path>" of every running process (except this one) whose image lies in one of dirs and whose
     // file name without extension is one of names (case-insensitive). Used by the grab self test after CANCEL.
     juce::StringArray findProcessesIn (const juce::Array<juce::File>& dirs, const juce::StringArray& names);
+
+    // argv as CommandLineToArgvW splits it (process self test of quoteCommandLine)
+    juce::StringArray parseCommandLine (const juce::String& commandLine);
 }
 }
 

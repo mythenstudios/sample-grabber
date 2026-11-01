@@ -60,6 +60,9 @@ Invoke-SelfTest "cache"  @{ SG_CACHE_SELFTEST = "1" }
 Invoke-SelfTest "state"  @{ SG_STATE_SELFTEST = $wav; SG_SELFTEST_TMP = (Join-Path $Work "state\tmp") }
 Invoke-SelfTest "export" @{ SG_EXPORT_SELFTEST = $wav }
 
+# Windows process tree: quoting round trip, kill() and destroying a running process leave nothing behind
+Invoke-SelfTest "proc" @{ SG_PROC_SELFTEST = "1" } -TimeoutSec 120
+
 # Needs the network (GitHub releases), installs yt-dlp/deno/ffmpeg into $tools for the grab tests
 Invoke-SelfTest "tools" @{ SG_TOOLS_SELFTEST = "1" } -TimeoutSec 900
 

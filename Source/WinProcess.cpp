@@ -14,7 +14,9 @@
   #define WIN32_LEAN_AND_MEAN 1
  #endif
  #include <windows.h>
+ #include <shellapi.h>   // CommandLineToArgvW (self test)
  #include <tlhelp32.h>
+ #pragma comment (lib, "shell32.lib")
 #endif
 
 #include "WinProcess.h"
@@ -360,16 +362,65 @@ juce::uint32 WinProcess::getExitCode() const
 
 bool WinProcess::kill()
 {
-    // Exit code 1: a killed run never reads as success
+    // Exit code 1: a killed run never reads as success. Termination is asynchronous: wait (up to 2 s) until the
+    // processes are really gone, so the caller can delete the files they wrote (no sharing violation from a
+    // grandchild like ffmpeg that still holds its output open). Only waits on kernel objects, takes no lock.
+    constexpr ULONGLONG maxWaitMs = 2000;
     if (impl->job != nullptr)
-        return ::TerminateJobObject (impl->job, 1) != FALSE;
+    {
+        const bool ok = ::TerminateJobObject (impl->job, 1) != FALSE;
+        if (! ok)
+            logError ("TerminateJobObject");
+
+        const ULONGLONG deadline = ::GetTickCount64() + maxWaitMs;
+        for (;;)
+        {
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info {};
+            if (! ::QueryInformationJobObject (impl->job, JobObjectBasicAccountingInformation, &info,
+                                               (DWORD) sizeof (info), nullptr))
+            {
+                logError ("QueryInformationJobObject");
+                break;
+            }
+            if (info.ActiveProcesses == 0)
+                break;
+            if (::GetTickCount64() >= deadline)
+            {
+                std::fprintf (stderr, "[SG] process: %lu process(es) still active 2 s after kill\n",
+                              (unsigned long) info.ActiveProcesses);
+                break;
+            }
+            ::Sleep (5);
+        }
+        return ok;
+    }
     if (impl->process != nullptr)
-        return ::TerminateProcess (impl->process, 1) != FALSE;
+    {
+        const bool ok = ::TerminateProcess (impl->process, 1) != FALSE;
+        ::WaitForSingleObject (impl->process, (DWORD) maxWaitMs);
+        return ok;
+    }
     return true;
 }
 
 namespace winproc
 {
+    juce::StringArray parseCommandLine (const juce::String& commandLine)
+    {
+        juce::StringArray result;
+        int argc = 0;
+        LPWSTR* argv = ::CommandLineToArgvW (commandLine.toWideCharPointer(), &argc);
+        if (argv == nullptr)
+        {
+            logError ("CommandLineToArgvW");
+            return result;
+        }
+        for (int i = 0; i < argc; ++i)
+            result.add (juce::String (argv[i]));
+        ::LocalFree (argv);
+        return result;
+    }
+
     juce::StringArray findProcessesIn (const juce::Array<juce::File>& dirs, const juce::StringArray& names)
     {
         juce::StringArray found;

@@ -270,7 +270,8 @@ void Downloader::cancel()
             if (ours && ! sg::storage::isInUse (f))
             {
                 std::fprintf (stderr, "[SG] cancel: removing partial %s\n", f.getFullPathName().toRawUTF8());
-                f.deleteFile();
+                if (! f.deleteFile())
+                    std::fprintf (stderr, "[SG] cancel: could not remove partial %s\n", f.getFullPathName().toRawUTF8());
             }
         }
     }
