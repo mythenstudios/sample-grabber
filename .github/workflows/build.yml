@@ -46,6 +46,19 @@ jobs:
           path: ${{ env.PKG }}
           retention-days: 7
 
+      # After the upload on purpose: a failing self test still leaves the package to download
+      - name: Self tests
+        shell: pwsh
+        run: ./scripts/ci/selftests.ps1 -App "build/SampleGrabberApp_artefacts/Release/Sample Grabber.exe" -Work "${{ runner.temp }}/sg-selftest"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-windows-x64
+          path: ${{ runner.temp }}/sg-selftest/out
+          retention-days: 7
+          if-no-files-found: ignore
+
   # Cross-check: Windows changes must not break the Linux build
   linux-x64:
     runs-on: ubuntu-22.04
