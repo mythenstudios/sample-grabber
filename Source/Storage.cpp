@@ -799,13 +799,15 @@ int CacheManager::runSelfTest()
         {
             const auto f = root.getChildFile (fk.path);
             f.getParentDirectory().createDirectory();
-            juce::FileOutputStream os (f);
-            if (os.openedOk())
             {
-                os.setPosition ((juce::int64) fk.mb * MB - 1);   // sparse file, cheap
-                os.writeByte (0);
+                juce::FileOutputStream os (f);
+                if (os.openedOk())
+                {
+                    os.setPosition ((juce::int64) fk.mb * MB - 1);   // sparse file, cheap
+                    os.writeByte (0);
+                }
             }
-            os.flush();
+            // Only after closing: Windows stamps the write time when a written handle is closed
             f.setLastModificationTime (juce::Time (now - (juce::int64) (fk.hours * 3600.0 * 1000.0)));
         }
     };
