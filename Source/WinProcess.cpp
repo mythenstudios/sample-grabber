@@ -365,33 +365,34 @@ bool WinProcess::kill()
     // Exit code 1: a killed run never reads as success. Termination is asynchronous: wait (up to 2 s) until the
     // processes are really gone, so the caller can delete the files they wrote (no sharing violation from a
     // grandchild like ffmpeg that still holds its output open). Only waits on kernel objects, takes no lock.
-    constexpr ULONGLONG maxWaitMs = 2000;
+    // ActiveProcesses of the job drops to 0 as soon as termination starts, while a process still runs down and
+    // holds its files (seen in CI). So wait on the process handles themselves: one is signalled only after its
+    // handle table is closed. They are opened before terminating, a process that is already gone is skipped.
+    constexpr DWORD maxWaitMs = 2000;
     if (impl->job != nullptr)
     {
+        struct
+        {
+            JOBOBJECT_BASIC_PROCESS_ID_LIST list;
+            ULONG_PTR more[MAXIMUM_WAIT_OBJECTS - 1];
+        } ids {};
+        HANDLE waits[MAXIMUM_WAIT_OBJECTS];
+        DWORD numWaits = 0;
+        const bool listed = ::QueryInformationJobObject (impl->job, JobObjectBasicProcessIdList, &ids, (DWORD) sizeof (ids), nullptr)
+                            || ::GetLastError() == ERROR_MORE_DATA;   // more than 64: wait for the first 64
+        if (listed)
+            for (DWORD i = 0; i < ids.list.NumberOfProcessIdsInList && i < MAXIMUM_WAIT_OBJECTS; ++i)
+                if (HANDLE h = ::OpenProcess (SYNCHRONIZE, FALSE, (DWORD) ids.list.ProcessIdList[i]))
+                    waits[numWaits++] = h;
+
         const bool ok = ::TerminateJobObject (impl->job, 1) != FALSE;
         if (! ok)
             logError ("TerminateJobObject");
 
-        const ULONGLONG deadline = ::GetTickCount64() + maxWaitMs;
-        for (;;)
-        {
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info {};
-            if (! ::QueryInformationJobObject (impl->job, JobObjectBasicAccountingInformation, &info,
-                                               (DWORD) sizeof (info), nullptr))
-            {
-                logError ("QueryInformationJobObject");
-                break;
-            }
-            if (info.ActiveProcesses == 0)
-                break;
-            if (::GetTickCount64() >= deadline)
-            {
-                std::fprintf (stderr, "[SG] process: %lu process(es) still active 2 s after kill\n",
-                              (unsigned long) info.ActiveProcesses);
-                break;
-            }
-            ::Sleep (5);
-        }
+        if (numWaits > 0 && ::WaitForMultipleObjects (numWaits, waits, TRUE, maxWaitMs) == WAIT_TIMEOUT)
+            std::fprintf (stderr, "[SG] process: tree still running 2 s after kill\n");
+        for (DWORD i = 0; i < numWaits; ++i)
+            ::CloseHandle (waits[i]);
         return ok;
     }
     if (impl->process != nullptr)
