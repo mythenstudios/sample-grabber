@@ -1,7 +1,12 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #pragma once
 #include <juce_core/juce_core.h>
 #include "ToolManager.h"
 #include "TimeRange.h"
+#include "WinProcess.h"   // Windows only, empty elsewhere
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -97,7 +102,12 @@ private:
 
     std::atomic<bool> jobActive { false };
     juce::CriticalSection procLock;
-    std::unique_ptr<juce::ChildProcess> proc;
+   #if JUCE_WINDOWS
+    using Process = sg::WinProcess;               // Job Object: kill() ends the whole tree; UTF-8 env, exact argv quoting
+   #else
+    using Process = juce::ChildProcess;
+   #endif
+    std::unique_ptr<Process> proc;                 // started/destroyed under procLock, read by the job thread
     juce::StringArray procArgs;                    // argv of proc (identifies it in /proc for the tree kill)
     juce::File jobDir;                             // cache folder the job writes to (empty for probes)
     juce::StringArray jobPreexisting;              // file names in jobDir when the job started

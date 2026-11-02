@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include <juce_dsp/juce_dsp.h>
@@ -1753,6 +1757,7 @@ void SampleGrabberProcessor::pushHistory()
         const juce::ScopedLock ml (metaLock);
         e.url = metaUrl;
         e.range = metaRange;
+        e.displayTitle = metaDisplayTitle;
         e.sourceSeconds = metaSourceSeconds;
         e.sourceKept = metaSourceKept;
         e.embedded = embeddedMode;
@@ -1816,12 +1821,13 @@ void SampleGrabberProcessor::installSample (std::shared_ptr<juce::AudioBuffer<fl
 }
 
 void SampleGrabberProcessor::setMeta (const juce::File& file, const juce::String& url, const juce::String& range, bool embedded,
-                                      float embTrimStart, float embTrimEnd, double sourceSeconds)
+                                      float embTrimStart, float embTrimEnd, double sourceSeconds, const juce::String& displayTitle)
 {
     const auto title = sg::storage::titleFromFile (file);
     const juce::ScopedLock ml (metaLock);
     metaPath = file.getFullPathName();
     metaTitle = title;
+    metaDisplayTitle = sg::storage::sanitizeDisplayTitle (displayTitle);
     metaUrl = url;
     metaRange = range;
     metaSourceSeconds = sourceSeconds;
@@ -1863,7 +1869,7 @@ bool SampleGrabberProcessor::goBack()
     keyValue = e.key;
     keyConfidence = e.keyConfidence;
 
-    setMeta (e.file, e.url, e.range, e.embedded, e.embTrimStart, e.embTrimEnd, e.sourceSeconds);
+    setMeta (e.file, e.url, e.range, e.embedded, e.embTrimStart, e.embTrimEnd, e.sourceSeconds, e.displayTitle);
     {
         const juce::ScopedLock ml (metaLock);
         metaSourceKept = e.sourceKept;
@@ -1873,10 +1879,10 @@ bool SampleGrabberProcessor::goBack()
 }
 
 bool SampleGrabberProcessor::loadSample (const juce::File& file, bool recordHistory, const juce::String& sourceUrl,
-                                         const juce::String& sourceRange)
+                                         const juce::String& sourceRange, const juce::String& displayTitle)
 {
     std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (file));
-    if (reader == nullptr || ! installFromReader (*reader, file, recordHistory, sourceUrl, sourceRange))
+    if (reader == nullptr || ! installFromReader (*reader, file, recordHistory, sourceUrl, sourceRange, false, 0.0f, 1.0f, -1.0, displayTitle))
         return false;
 
     // Re-grab after "SOURCE MISSING": same link + range and the same length -> the saved selection comes back.
@@ -1915,7 +1921,8 @@ bool SampleGrabberProcessor::loadSample (const juce::File& file, bool recordHist
 
 bool SampleGrabberProcessor::installFromReader (juce::AudioFormatReader& readerRef, const juce::File& file, bool recordHistory,
                                                 const juce::String& url, const juce::String& range, bool embedded,
-                                                float embTrimStart, float embTrimEnd, double sourceSeconds)
+                                                float embTrimStart, float embTrimEnd, double sourceSeconds,
+                                                const juce::String& displayTitle)
 {
     auto* reader = &readerRef;
     if (reader->lengthInSamples <= 0 || reader->numChannels == 0
@@ -1942,7 +1949,7 @@ bool SampleGrabberProcessor::installFromReader (juce::AudioFormatReader& readerR
 
     if (! embedded)
         sourceSeconds = (double) reader->lengthInSamples / juce::jmax (1.0, reader->sampleRate);
-    setMeta (file, url, range, embedded, embTrimStart, embTrimEnd, sourceSeconds);
+    setMeta (file, url, range, embedded, embTrimStart, embTrimEnd, sourceSeconds, displayTitle);
     installSample (std::move (fresh), file, true);
     return true;
 }
@@ -2603,6 +2610,12 @@ juce::String SampleGrabberProcessor::getSourceRange() const
     return metaRange;
 }
 
+juce::String SampleGrabberProcessor::getDisplayTitle() const
+{
+    const juce::ScopedLock ml (metaLock);
+    return metaDisplayTitle;
+}
+
 bool SampleGrabberProcessor::isEmbedSettled() const
 {
     const auto key = computeEmbedKey();
@@ -2645,7 +2658,7 @@ void SampleGrabberProcessor::getStateInformation (juce::MemoryBlock& dest)
 {
     auto state = apvts.copyState();
 
-    juce::String path, url, range;
+    juce::String path, url, range, shownTitle;
     double srcSeconds = -1.0;
     bool emb = false, srcKept = true;
     float eS = 0.0f, eE = 1.0f, flacTS = 0.0f, flacTE = 1.0f;
@@ -2658,6 +2671,7 @@ void SampleGrabberProcessor::getStateInformation (juce::MemoryBlock& dest)
         path = metaPath;
         url = metaUrl;
         range = metaRange;
+        shownTitle = metaDisplayTitle;
         srcSeconds = metaSourceSeconds;
         srcKept = metaSourceKept;
         emb = embeddedMode;
@@ -2677,6 +2691,7 @@ void SampleGrabberProcessor::getStateInformation (juce::MemoryBlock& dest)
         state.setProperty ("samplePath", pending->path, nullptr);
         state.setProperty ("sourceUrl", pending->url, nullptr);
         state.setProperty ("sourceRange", pending->range, nullptr);
+        state.setProperty ("sourceTitle", sg::storage::sanitizeDisplayTitle (pending->displayTitle), nullptr);
         state.setProperty ("sourceSeconds", pending->sourceSeconds, nullptr);
         state.setProperty ("sourceKept", pending->sourceKept, nullptr);
         state.setProperty ("trimStart", (double) pending->trimStart, nullptr);
@@ -2700,6 +2715,7 @@ void SampleGrabberProcessor::getStateInformation (juce::MemoryBlock& dest)
         state.setProperty ("samplePath", path, nullptr);
         state.setProperty ("sourceUrl", url, nullptr);
         state.setProperty ("sourceRange", range, nullptr);
+        state.setProperty ("sourceTitle", sg::storage::sanitizeDisplayTitle (shownTitle), nullptr);
         state.setProperty ("sourceSeconds", srcSeconds, nullptr);
         state.setProperty ("sourceKept", srcKept, nullptr);
         state.setProperty ("trimStart", (double) toOrig (trimStart.load()), nullptr);
@@ -2779,6 +2795,7 @@ void SampleGrabberProcessor::setStateInformation (const void* data, int size)
         info.path = state.getProperty ("samplePath").toString();
         info.url = state.getProperty ("sourceUrl").toString();
         info.range = state.getProperty ("sourceRange").toString();
+        info.displayTitle = sg::storage::sanitizeDisplayTitle (state.getProperty ("sourceTitle").toString());   // display only; older projects: empty
         {
             const double secs = state.getProperty ("sourceSeconds", -1.0);
             info.sourceSeconds = std::isfinite (secs) && secs > 0.0 && secs < 1.0e7 ? secs : -1.0;
@@ -2802,7 +2819,7 @@ void SampleGrabberProcessor::setStateInformation (const void* data, int size)
         }
 
         // Our own properties are not APVTS parameters; removing them keeps apvts.state clean
-        for (auto id : { "samplePath", "sourceUrl", "sourceRange", "sourceSeconds", "sourceKept", "trimStart", "trimEnd", "sliceMode", "bpm", "bpmOctave",
+        for (auto id : { "samplePath", "sourceUrl", "sourceRange", "sourceTitle", "sourceSeconds", "sourceKept", "trimStart", "trimEnd", "sliceMode", "bpm", "bpmOctave",
                          "embTrimStart", "embTrimEnd", "embBytes" })
             state.removeProperty (id, nullptr);
 
@@ -2900,7 +2917,7 @@ void SampleGrabberProcessor::applyRestore (const RestoreInfo& info)
         return rd;
     };
 
-    if (orig != juce::File() && f.existsAsFile() && loadSample (f, false, info.url, info.range))
+    if (orig != juce::File() && f.existsAsFile() && loadSample (f, false, info.url, info.range, info.displayTitle))
     {
         setTrim (info.trimStart, info.trimEnd, false);
         restoreTempo();
@@ -2926,7 +2943,8 @@ void SampleGrabberProcessor::applyRestore (const RestoreInfo& info)
             srcSeconds = (double) rd->lengthInSamples / rd->sampleRate / (double) (info.embTrimEnd - info.embTrimStart);
         regrabSeconds = srcSeconds;
 
-        if (rd != nullptr && installFromReader (*rd, orig, false, info.url, info.range, true, info.embTrimStart, info.embTrimEnd, srcSeconds))
+        if (rd != nullptr && installFromReader (*rd, orig, false, info.url, info.range, true, info.embTrimStart, info.embTrimEnd, srcSeconds,
+                                                info.displayTitle))
         {
             seedEmbedded (info.flac);   // before narrowing the trim: the block is the whole embedded audio
 
@@ -2966,6 +2984,7 @@ void SampleGrabberProcessor::applyRestore (const RestoreInfo& info)
             const juce::ScopedLock ml (metaLock);
             metaPath = orig.getFullPathName();
             metaTitle = sg::storage::titleFromFile (orig);
+            metaDisplayTitle = info.displayTitle;
             metaUrl = info.url;
             metaRange = info.range;
             metaSourceSeconds = info.sourceSeconds;

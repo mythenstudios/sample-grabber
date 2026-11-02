@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "PluginProcessor.h"
 #include "ui/SGLookAndFeel.h"
@@ -5,6 +9,7 @@
 #include "Downloader.h"
 #include "TimeRange.h"
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <thread>
@@ -239,9 +244,10 @@ namespace selftest
 
         juce::MemoryBlock st;
         int selLen = 0;
+        const auto shownTitle = juce::String::fromUTF8 ("Selftest - Ausl\xc3\xa4nder");   // non-ASCII display title round trip
         {
             SampleGrabberProcessor a;
-            expect (a.loadSample (copy, true, "https://example.com/watch?v=selftest"), "load source");
+            expect (a.loadSample (copy, true, "https://example.com/watch?v=selftest", {}, shownTitle), "load source");
             a.setTrim (0.25f, 0.5f);
             a.setSliceMode (SampleGrabberProcessor::SliceMode::beat);
             a.analyse();
@@ -268,6 +274,7 @@ namespace selftest
             printState ("B source present", b);
             expect (b.getLoadedFile() == copy && std::abs (b.getTrimStart() - 0.25f) < 1.0e-4f, "B loads source + trim");
             expect (b.getRestoreNote().isEmpty(), "B no note");
+            expect (b.getDisplayTitle() == shownTitle, "B display title");
             expect (b.getEmbeddedAudioBytes() > 0, "B seeded FLAC from state");
         }
 
@@ -283,6 +290,7 @@ namespace selftest
             expect (c.getTrimStart() < 1.0e-6f && c.getTrimEnd() > 1.0f - 1.0e-6f, "C trim = whole");
             expect (c.getRestoreNote() == "SOURCE MISSING - USING SAVED SELECTION", "C note");
             expect (c.getSourceUrl() == "https://example.com/watch?v=selftest", "C url kept");
+            expect (c.getDisplayTitle() == shownTitle, "C display title");
             expect (c.getSliceMode() == SampleGrabberProcessor::SliceMode::beat, "C slice mode");
             // Narrow the selection inside the embedded audio, save again: trims must come out in original coordinates
             c.setTrim (0.5f, 1.0f);
@@ -425,6 +433,96 @@ namespace selftest
 
         std::fprintf (stderr, "[SG-STATE] %s\n", failures == 0 ? "ALL OK" : "FAILURES");
         return failures == 0 ? 0 : 1;
+    }
+
+    // Part of SG_SETTINGS_SELFTEST (not Windows: the registry is left alone there): folder priority env > stored > default
+    // for the export folder, plus checkChosenFolder. Writes settings.xml (exportDir) and restores the old value; test
+    // folders go to the temp folder (TMPDIR). Exit code 0 = ok.
+    static int runFolders()
+    {
+       #if JUCE_WINDOWS
+        std::fprintf (stderr, "[SG-SETTINGS] folders: skipped on Windows (registry)\n");
+        return 0;
+       #else
+        using sg::storage::Folder;
+        int failures = 0;
+        auto expect = [&] (bool ok, const char* what)
+        {
+            std::fprintf (stderr, "[SG-SETTINGS] folders: %s %s\n", ok ? "ok  " : "FAIL", what);
+            if (! ok)
+                ++failures;
+        };
+
+        const auto oldStored = sg::storage::storedFolder (Folder::exports);
+        const auto oldEnv = juce::SystemStats::getEnvironmentVariable ("SG_EXPORT_DIR", {});
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("sg-folders-" + juce::String (juce::Time::currentTimeMillis()));
+        const auto stored = scratch.getChildFile ("stored exports");
+        const auto envDir = scratch.getChildFile ("env exports");
+
+        ::unsetenv ("SG_EXPORT_DIR");
+        expect (sg::storage::setStoredFolder (Folder::exports, {}), "reset stored value");
+        expect (sg::storage::exportRoot() == sg::storage::defaultFolder (Folder::exports), "nothing set -> default");
+        expect (sg::storage::setStoredFolder (Folder::exports, stored.getFullPathName()), "store a folder");
+        expect (sg::storage::storedFolder (Folder::exports) == stored.getFullPathName(), "stored value reads back");
+        expect (sg::storage::exportRoot() == stored && stored.isDirectory(), "stored -> used (and created)");
+        ::setenv ("SG_EXPORT_DIR", envDir.getFullPathName().toRawUTF8(), 1);
+        expect (sg::storage::folderFromEnv (Folder::exports) && sg::storage::exportRoot() == envDir, "env wins over stored");
+        ::unsetenv ("SG_EXPORT_DIR");
+        sg::settings::set ("exportDir", "relative/path");
+        expect (sg::storage::exportRoot() == sg::storage::defaultFolder (Folder::exports), "relative stored -> default");
+        sg::settings::set ("exportDir", "   ");
+        expect (sg::storage::exportRoot() == sg::storage::defaultFolder (Folder::exports), "blank stored -> default");
+        sg::settings::set ("exportDir", "/proc/sg-cannot-create/x");
+        expect (sg::storage::exportRoot() == sg::storage::defaultFolder (Folder::exports), "uncreatable stored -> default");
+
+        juce::File chosen;
+        expect (sg::storage::checkChosenFolder (Folder::exports, "rel/dir", chosen).failed(), "check: relative refused");
+        expect (sg::storage::checkChosenFolder (Folder::exports, "/", chosen).failed(), "check: root refused");
+        expect (sg::storage::checkChosenFolder (Folder::cache, juce::File::getSpecialLocation (juce::File::userHomeDirectory)
+                                                   .getFullPathName(), chosen).failed(), "check: home refused as cache");
+        expect (sg::storage::checkChosenFolder (Folder::exports, sg::storage::cacheRoot().getChildFile ("x").getFullPathName(),
+                                                chosen).failed(), "check: exports inside the cache refused");
+        const auto foreign = scratch.getChildFile ("foreign");
+        foreign.getChildFile ("song.wav").create();
+        expect (sg::storage::checkChosenFolder (Folder::cache, "\"" + foreign.getFullPathName() + "\"", chosen).wasOk()
+                    && chosen == foreign.getChildFile ("Sample Grabber Cache") && chosen.isDirectory(),
+                "check: foreign folder as cache -> own subfolder");
+        const auto onlyDl = scratch.getChildFile ("only downloads");
+        onlyDl.getChildFile ("downloads").getChildFile ("myfile").create();
+        expect (sg::storage::checkChosenFolder (Folder::cache, onlyDl.getFullPathName(), chosen).wasOk()
+                    && chosen == onlyDl.getChildFile ("Sample Grabber Cache"),
+                "check: folder with only downloads/myfile as cache -> own subfolder");
+        const auto fresh = scratch.getChildFile ("new cache");
+        expect (sg::storage::checkChosenFolder (Folder::cache, fresh.getFullPathName(), chosen).wasOk() && chosen == fresh
+                    && fresh.isDirectory(), "check: new folder as cache -> used as is");
+
+        // Stored cache folder (installer writes it unchecked): same rules as CHANGE
+        {
+            const auto oldCacheStored = sg::storage::storedFolder (Folder::cache);
+            const auto oldCacheEnv = juce::SystemStats::getEnvironmentVariable ("SG_CACHE_DIR", {});
+            ::unsetenv ("SG_CACHE_DIR");
+            sg::settings::set ("cacheDir", juce::File::getSpecialLocation (juce::File::userHomeDirectory).getFullPathName());
+            expect (sg::storage::resolveFolder (Folder::cache) == sg::storage::defaultFolder (Folder::cache), "stored cache = home -> default");
+            sg::settings::set ("cacheDir", onlyDl.getFullPathName());
+            expect (sg::storage::resolveFolder (Folder::cache) == onlyDl.getChildFile ("Sample Grabber Cache")
+                        && ! sg::storage::hasCacheMarker (onlyDl), "stored cache = foreign folder -> own subfolder");
+            const auto storedFresh = scratch.getChildFile ("stored new cache");
+            sg::settings::set ("cacheDir", storedFresh.getFullPathName());
+            expect (sg::storage::resolveFolder (Folder::cache) == storedFresh, "stored cache = new folder -> used as is");
+            sg::storage::setStoredFolder (Folder::cache, oldCacheStored);
+            if (oldCacheEnv.isNotEmpty())
+                ::setenv ("SG_CACHE_DIR", oldCacheEnv.toRawUTF8(), 1);
+        }
+
+        // Restore
+        sg::storage::setStoredFolder (Folder::exports, oldStored);
+        if (oldEnv.isNotEmpty())
+            ::setenv ("SG_EXPORT_DIR", oldEnv.toRawUTF8(), 1);
+        scratch.deleteRecursively();
+        std::fprintf (stderr, "[SG-SETTINGS] folders: %s\n", failures == 0 ? "ALL OK" : "FAILURES");
+        return failures == 0 ? 0 : 1;
+       #endif
     }
 
     // SG_EXPORT_SELFTEST=<wav>: staging + drag fallback + reuse, files go to SG_EXPORT_DIR
@@ -622,6 +720,24 @@ namespace selftest
                         log ("still running: " + d.getFileName() + " " + cmd.substring (0, 100));
                     }
                 }
+           #elif JUCE_WINDOWS
+            // No other process' command line without reading its PEB: match by image instead (yt-dlp.exe, its
+            // PyInstaller child of the same name, ffmpeg/ffprobe, deno) in our tools folder or wherever the tools resolve
+            juce::Array<juce::File> dirs { ToolManager::toolsDir() };
+            {
+                juce::SharedResourcePointer<ToolManager> tm;
+                for (const auto t : { ToolManager::Tool::ytdlp, ToolManager::Tool::ffmpeg, ToolManager::Tool::deno })
+                {
+                    const auto exe = tm->getExecutable (t);
+                    if (exe != juce::File())
+                        dirs.addIfNotAlreadyThere (exe.getParentDirectory());
+                }
+            }
+            for (const auto& p : sg::winproc::findProcessesIn (dirs, { "yt-dlp", "ffmpeg", "ffprobe", "deno" }))
+            {
+                ++survivors;
+                log ("still running: " + p);
+            }
            #endif
             const auto left = sg::storage::cacheRoot().getChildFile ("downloads").findChildFiles (juce::File::findFiles, false);
             for (const auto& f : left)
@@ -759,6 +875,164 @@ namespace selftest
     };
 }
 
+namespace selftest
+{
+    // SG_PROC_SELFTEST=1 (Windows only, needs SG_CACHE_DIR): argv quoting round trip through CommandLineToArgvW, and
+    // that kill() and destroying a running WinProcess leave no process of its tree behind. The tree is
+    // sgproc-cmd.exe -> sgproc-cmd2.exe -> ping.exe (copies of cmd.exe with unique names in a scratch folder, so
+    // findProcessesIn sees exactly our processes).
+    int runProc()
+    {
+       #if ! JUCE_WINDOWS
+        std::fprintf (stderr, "[SG-PROC] skipped (Windows only)\n");
+        return 0;
+       #else
+        if (! requireScratch())
+            return 1;
+
+        int failures = 0;
+        auto log = [] (const juce::String& s) { std::fprintf (stderr, "[SG-PROC] %s\n", s.toRawUTF8()); };
+        auto expect = [&] (bool ok, const juce::String& what)
+        {
+            log ((ok ? "ok   " : "FAIL ") + what);
+            if (! ok)
+                ++failures;
+        };
+        auto now = [] { return juce::Time::getMillisecondCounterHiRes(); };
+
+        // a) Quoting: every case alone and all together, argv[0] = an exe path (own parsing rules)
+        {
+            const juce::StringArray cases { "a b", "a\"b", "C:\\dir with space\\", "", "\t", "\\\\\"", "trailing\\\\",
+                                            "x", "a\\b", "\\\"", "a\\\\b c", "\"", "tab\tin", "new\nline" };
+            auto visible = [] (const juce::String& s)
+            {
+                return "[" + s.replace ("\t", "<TAB>").replace ("\n", "<LF>") + "]";
+            };
+            auto roundTrip = [&] (const juce::StringArray& args, const juce::String& what)
+            {
+                const auto cmd = sg::WinProcess::quoteCommandLine (args);
+                const auto back = sg::winproc::parseCommandLine (cmd);
+                const bool ok = back == args;
+                expect (ok, "quote " + what + " -> " + visible (cmd));
+                if (! ok)
+                    for (int i = 0; i < juce::jmax (args.size(), back.size()); ++i)
+                        log ("      arg " + juce::String (i) + ": in " + visible (args[i]) + " out " + visible (back[i]));
+            };
+            for (const auto* exe : { "C:\\sg\\tool.exe", "C:\\Program Files\\sg tool\\tool.exe" })
+            {
+                for (const auto& c : cases)
+                    roundTrip (juce::StringArray { juce::String (exe), c }, visible (c));
+                juce::StringArray all { juce::String (exe) };
+                all.addArray (cases);
+                roundTrip (all, "all cases, exe " + visible (exe));
+            }
+        }
+
+        // Scratch copies of cmd.exe (+ their language resources, best effort)
+        const auto sys = juce::File::getSpecialLocation (juce::File::windowsSystemDirectory);
+        const auto scratch = sg::storage::cacheRoot().getChildFile ("proc-selftest");
+        scratch.deleteRecursively();
+        scratch.createDirectory();
+        const juce::StringArray names { "sgproc-cmd", "sgproc-cmd2" };
+        for (const auto& n : names)
+        {
+            const auto copy = scratch.getChildFile (n + ".exe");
+            expect (sys.getChildFile ("cmd.exe").copyFileTo (copy), "copy cmd.exe -> " + copy.getFileName());
+        }
+        // Messages of cmd.exe live in <lang>\cmd.exe.mui, looked up by the image name
+        for (const auto& lang : sys.findChildFiles (juce::File::findDirectories, false, "*", juce::File::FollowSymlinks::no))
+        {
+            const auto mui = lang.getChildFile ("cmd.exe.mui");
+            if (! mui.existsAsFile())
+                continue;
+            const auto dest = scratch.getChildFile (lang.getFileName());
+            dest.createDirectory();
+            for (const auto& n : names)
+                mui.copyFileTo (dest.getChildFile (n + ".exe.mui"));
+        }
+        juce::StringArray treeArgs;
+        treeArgs.add (scratch.getChildFile ("sgproc-cmd.exe").getFullPathName());
+        treeArgs.add ("/c");
+        treeArgs.add (scratch.getChildFile ("sgproc-cmd2.exe").getFullPathName());
+        treeArgs.add ("/c");
+        treeArgs.add (sys.getChildFile ("ping.exe").getFullPathName());
+        treeArgs.addArray (juce::StringArray { "-n", "60", "127.0.0.1" });
+        const juce::Array<juce::File> dirs { scratch };
+        auto running = [&] { return sg::winproc::findProcessesIn (dirs, names); };
+        auto waitUntil = [&] (std::function<bool()> cond, double ms)
+        {
+            const auto end = now() + ms;
+            for (;;)
+            {
+                if (cond())
+                    return true;
+                if (now() >= end)
+                    return false;
+                juce::Thread::sleep (20);
+            }
+        };
+        auto startTree = [&] (sg::WinProcess& p, const char* tag)
+        {
+            const bool started = p.start (treeArgs, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr);
+            expect (started, juce::String (tag) + ": tree started");
+            const bool up = started && waitUntil ([&] { return running().size() == names.size(); }, 5000);
+            for (const auto& r : running())
+                log ("      running: " + r);
+            expect (up, juce::String (tag) + ": both cmd copies run");
+            return up;
+        };
+
+        // b) + d) kill() ends the whole tree before it returns, reading to EOF afterwards does not hang
+        {
+            auto p = std::make_unique<sg::WinProcess>();
+            if (startTree (*p, "kill"))
+            {
+                const auto t = now();
+                p->kill();
+                const auto killMs = now() - t;
+                const auto left = running();
+                for (const auto& r : left)
+                    log ("      still running: " + r);
+                expect (left.isEmpty(), "kill: nothing left right after kill() (" + juce::String (killMs, 0) + " ms)");
+                expect (p->getExitCode() == 1, "kill: exit code 1 (got " + juce::String ((juce::int64) p->getExitCode()) + ")");
+
+                const auto t2 = now();
+                char buf[512];
+                int total = 0;
+                for (;;)
+                {
+                    const int n = p->readProcessOutput (buf, (int) sizeof (buf));
+                    if (n <= 0)
+                        break;
+                    total += n;
+                }
+                const auto readMs = now() - t2;
+                expect (readMs < 1000.0, "kill: read to EOF after kill took " + juce::String (readMs, 0) + " ms ("
+                                             + juce::String (total) + " bytes)");
+            }
+        }
+
+        // c) Destroying the object without kill() (plugin closed mid-download): KILL_ON_JOB_CLOSE ends the tree
+        {
+            auto p = std::make_unique<sg::WinProcess>();
+            if (startTree (*p, "destroy"))
+            {
+                const auto t = now();
+                p.reset();
+                const bool gone = waitUntil ([&] { return running().isEmpty(); }, 2000);
+                for (const auto& r : running())
+                    log ("      still running: " + r);
+                expect (gone, "destroy: nothing left after " + juce::String (now() - t, 0) + " ms");
+            }
+        }
+
+        scratch.deleteRecursively();
+        log (failures == 0 ? "ALL OK" : "FAILURES");
+        return failures == 0 ? 0 : 1;
+       #endif
+    }
+}
+
 class SampleGrabberApp : public juce::JUCEApplication
 {
 public:
@@ -768,7 +1042,7 @@ public:
 
     void initialise (const juce::String&) override
     {
-        // Self-test of the tool installation without a window: SG_TOOLS_SELFTEST=1|update|force [SG_TOOLS_DIR=<folder>]
+        // Self-test of the tool installation without a window: SG_TOOLS_SELFTEST=1|update|force|remove [SG_TOOLS_DIR=<folder>]
         // (test helpers: SG_TOOLS_ONLY=yt-dlp,deno,ffmpeg, SG_TOOLS_FAKE_BAD_SHA=1|<tool>, SG_TOOLS_HTTP=juce). Exit code 0 = ok.
         // SG_SETTINGS_SELFTEST=1: read settings.xml and write one value back unchanged (tests .bad handling)
         if (juce::SystemStats::getEnvironmentVariable ("SG_SETTINGS_SELFTEST", {}).isNotEmpty())
@@ -779,6 +1053,7 @@ public:
                       << " autoUpdateYtDlp=" << (autoYt ? "on" : "off") << std::endl;
             ToolManager::setAutoUpdateYtDlp (autoYt);
             std::cerr << "[SG-SETTINGS] written, theme now=" << sg::settings::get ("theme", "(default)").toStdString() << std::endl;
+            setApplicationReturnValue (selftest::runFolders());
             quit();
             return;
         }
@@ -809,6 +1084,13 @@ public:
         if (juce::SystemStats::getEnvironmentVariable ("SG_RANGE_SELFTEST", {}).isNotEmpty())
         {
             setApplicationReturnValue (selftest::runRange());
+            quit();
+            return;
+        }
+
+        if (juce::SystemStats::getEnvironmentVariable ("SG_PROC_SELFTEST", {}).isNotEmpty())
+        {
+            setApplicationReturnValue (selftest::runProc());
             quit();
             return;
         }

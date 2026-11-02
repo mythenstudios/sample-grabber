@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #pragma once
 #include "PluginProcessor.h"
 #include "Downloader.h"
@@ -42,13 +46,16 @@ private:
     void onFetchClicked();
     void startGrab();
     void beginBusy (const juce::String& status);
-    bool loadFromFile (const juce::File&, const juce::String& sourceUrl = {}, const juce::String& sourceRange = {});
+    bool loadFromFile (const juce::File&, const juce::String& sourceUrl = {}, const juce::String& sourceRange = {},
+                       const juce::String& displayTitle = {});
+    juce::String loadedName() const;               // name of the loaded sample for status line and DETECTED panel
 
     // One grab request: link or local file, optional range, length once known (probe or file header)
     struct GrabSpec
     {
         bool isUrl = false;
         juce::String url;                 // link (isUrl)
+        juce::String title;               // link: real title from the probe (display only), may be empty
         juce::File file;                  // local file (! isUrl)
         bool native = false;              // JUCE reads it directly (no ffmpeg needed without a range)
         int bits = 16;                    // native: bit depth, kept when cutting a range
@@ -147,6 +154,8 @@ private:
     int lastEmbedWarn = 0;                         // processor.getEmbedWarnVersion() already shown
     juce::String pendingGrabUrl;                   // link of the running grab (saved with the sample for re-grabbing)
     juce::String pendingGrabRange;                 // its range text (sg::range::toText), empty = whole source
+    juce::String pendingGrabTitle;                 // its real title from the probe (display only), empty = from the file name
+    juce::String snapshotTitle;                    // SG_SNAPSHOT_TITLE (developer aid): display title for a loaded file
     juce::String grabNote;                         // appended to the progress phase (e.g. LENGTH UNKNOWN)
     juce::String autoRangeText;                    // range text last filled in from a link (t=...), replaced on URL change
     GrabSpec confirmSpec;                          // long source waiting for GRAB ALL

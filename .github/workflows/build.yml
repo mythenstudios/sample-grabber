@@ -1,0 +1,114 @@
+name: build
+
+on:
+  push:
+    branches: [main, "win/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the running build
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    # Pinned: windows-latest moved to Visual Studio 2026, JUCE 8.0.4 is only known to build with VS 2022
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --target SampleGrabber_VST3 SampleGrabberApp --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $out = "dist/sample-grabber-$sha-windows-x64"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item -Recurse "build/SampleGrabber_artefacts/Release/VST3/Sample Grabber.vst3" $out
+          Copy-Item "build/SampleGrabberApp_artefacts/Release/Sample Grabber.exe" $out
+          Copy-Item LICENSE $out
+          if (-not (Test-Path "$out/Sample Grabber.vst3/Contents/x86_64-win/Sample Grabber.vst3")) { throw "VST3 binary missing" }
+          Get-ChildItem -Recurse -Force $out | Select-Object FullName, Length | Format-Table -AutoSize
+          "PKG=$out" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sample-grabber-windows-x64
+          path: ${{ env.PKG }}
+          retention-days: 7
+
+      # Inno Setup is preinstalled on windows-2022 (6.7.x); the dark wizard needs 6.6+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "Inno Setup not found at $iscc" }
+          # ISCC.exe carries no version resource (0.0.0.0): read the installed version from the uninstall entry
+          $keys = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1",
+                  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1"
+          $dv = ($keys | ForEach-Object { (Get-ItemProperty $_ -ErrorAction SilentlyContinue).DisplayVersion } | Where-Object { $_ } | Select-Object -First 1)
+          "Inno Setup: $dv"
+          if ($dv -and ([version]($dv -replace '[^0-9.].*$', '') -lt [version]"6.7.0")) {
+            throw "Inno Setup $dv too old (WizardBackColor needs 6.7, dark wizard 6.6)"
+          }
+          $ver = (Select-String -Path CMakeLists.txt -Pattern 'project\(SampleGrabber VERSION ([0-9.]+)\)').Matches[0].Groups[1].Value
+          $pkg = (Resolve-Path $env:PKG).Path
+          & $iscc "/DAppVersion=$ver" "/DPkgDir=$pkg" "/O$PWD\dist\setup" installer\SampleGrabber.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          $setup = Get-ChildItem dist\setup\*.exe | Select-Object -First 1
+          "SETUP=$($setup.FullName)" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sample-grabber-windows-x64-setup
+          path: ${{ env.SETUP }}
+          retention-days: 7
+
+      # Silent per-user install + uninstall: files land where the summary says, the uninstaller cleans up
+      - name: Installer self test
+        shell: pwsh
+        run: ./scripts/ci/installer-test.ps1 -Setup "$env:SETUP"
+
+      # After the upload on purpose: a failing self test still leaves the package to download
+      - name: Self tests
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./scripts/ci/selftests.ps1 -App "build/SampleGrabberApp_artefacts/Release/Sample Grabber.exe" -Work "${{ runner.temp }}/sg-selftest"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-windows-x64
+          path: ${{ runner.temp }}/sg-selftest/out
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Cross-check: Windows changes must not break the Linux build
+  linux-x64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            libasound2-dev libjack-jackd2-dev libfreetype-dev libfontconfig1-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev \
+            libxrandr-dev libxrender-dev libglu1-mesa-dev mesa-common-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --target SampleGrabber_VST3 SampleGrabberApp

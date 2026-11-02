@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #pragma once
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
@@ -5,27 +9,54 @@
 #include <atomic>
 
 // Storage layout (never used on the audio thread):
-//  - Cache root: <user data>/SampleGrabber/cache (test override SG_CACHE_DIR) with
+//  - Cache root: <user data>/SampleGrabber/cache (Windows: Local AppData; user setting, test override SG_CACHE_DIR) with
 //      downloads/  yt-dlp results          imports/  ffmpeg conversions
-//      staging/    pre-rendered drag-out files, one subfolder per plugin instance
-//    Everything in the cache may be deleted (CLEAR NOW, auto-clean), except files in use by a processor of this process.
-//  - Export root: <Music>/Sample Grabber/<title>/ (test override SG_EXPORT_DIR). Files dragged into a DAW live here and
+//      staging/    pre-rendered drag-out files, one subfolder per plugin instance       tmp/  probe info JSONs
+//    Everything in these four subfolders may be deleted (CLEAR NOW, auto-clean), except files in use by a processor of
+//    this process. Files directly in the root are never deleted.
+//  - Export root: <Music>/Sample Grabber/<title>/ (user setting, test override SG_EXPORT_DIR). Files dragged into a DAW live here and
 //    are NEVER deleted automatically (DAWs often only reference the dragged file).
 namespace sg::storage
 {
     juce::File appDataDir();                               // <user data>/SampleGrabber
-    juce::File cacheRoot();                                // SG_CACHE_DIR or appDataDir()/cache
-    juce::File cacheSubdir (const juce::String& sub);      // cacheRoot()/sub, created (+ marker, see ensureCacheRoot)
+
+    // Folder settings. Priority: env var (SG_EXPORT_DIR / SG_CACHE_DIR) > stored setting > default.
+    // Stored: Windows registry HKCU\Software\Mythen Studios\Sample Grabber, REG_SZ "ExportDir"/"CacheDir" (written by
+    // the installer and by CHANGE in the settings overlay); other systems settings.xml keys "exportDir"/"cacheDir".
+    // An empty or non-absolute stored value counts as not set (default). Any thread except audio.
+    enum class Folder { exports, cache };
+    juce::File defaultFolder (Folder);
+    juce::String storedFolder (Folder);                    // raw stored value (trimmed), empty = none
+    bool setStoredFolder (Folder, const juce::String& absPath);   // empty = remove (default again); message thread
+    bool folderFromEnv (Folder);                           // env var set -> it wins, CHANGE has no effect
+    juce::File resolveFolder (Folder);                     // env > stored > default, evaluated on every call
+    // Checks a folder typed/picked by the user: absolute, creatable, not a filesystem root; for the cache cacheFolderFor
+    // (not home/Music/user data/export/tools folder; a non-empty foreign folder gets a subfolder "Sample Grabber Cache",
+    // never mark or clean foreign files). Creates it. Returns the folder to store or an error text.
+    juce::Result checkChosenFolder (Folder, const juce::String& typed, juce::File& result);
+    // Cache rule shared by CHANGE and stored values (registry/settings.xml, e.g. written by the installer; env vars are
+    // not checked): unsafe folder (see isSafeCacheRoot, tools folder) -> error; a folder that is neither empty nor marked
+    // -> "<dir>/Sample Grabber Cache" (error if that one holds foreign files too). Does not create anything.
+    juce::Result cacheFolderFor (const juce::File& dir, juce::File& result);
+
+    // resolveFolder (cache), read ONCE per process (change = restart) and marked right away (ensureCacheRoot). A stored
+    // folder that cannot be marked is replaced by the default.
+    juce::File cacheRoot();
+    // cacheRoot()/sub, created only if the root carries the marker (or comes from SG_CACHE_DIR); else logged, not created
+    juce::File cacheSubdir (const juce::String& sub);
     constexpr const char* cacheMarkerName = ".sg-cache";
 
-    // Creates the cache root and our marker file. The marker is only added to a folder that is new, empty or contains
-    // nothing but our own subfolders (or is the default location), so a mistaken SG_CACHE_DIR never becomes cleanable.
+    // Creates root and our marker file. The marker is only added to a folder that is new or completely empty, or with
+    // allowAnyContent (built-in default location, old installs); never to unsafe folders. true = marker present.
+    bool markCacheRoot (const juce::File& root, bool allowAnyContent);
+    // markCacheRoot (cacheRoot()), any content allowed only for the default location, so a mistaken SG_CACHE_DIR never
+    // becomes cleanable.
     bool ensureCacheRoot();
     bool hasCacheMarker (const juce::File& root);
     // false (with reason) if root must never be cleaned: no marker, home, filesystem root, Music folder, user data folder,
-    // export root or a parent of it
+    // export root or a parent of it, tools folder or a parent of it
     bool isSafeCacheRoot (const juce::File& root, juce::String& whyNot);
-    juce::File exportRoot();                               // SG_EXPORT_DIR or <Music>/Sample Grabber
+    juce::File exportRoot();                               // resolveFolder (exports), every call (change applies at once)
     bool isInsideCache (const juce::File&);
 
     // Saved projects may still point to the pre-cache locations appDataDir()/downloads|imports/<name>.
@@ -35,6 +66,9 @@ namespace sg::storage
     // File-name safe title on every OS: Unicode letters/digits kept, only <>:"/\|?* and control characters replaced,
     // no leading/trailing dots or spaces, Windows reserved names (CON, NUL, COM1, ...) prefixed; max 60 characters; never empty
     juce::String sanitizeTitle (const juce::String&);
+    // Title for display/state only (yt-dlp title, project file): control characters (< 0x20, 0x7F) removed, trimmed,
+    // at most 300 characters (code points). Unicode kept. May be empty.
+    juce::String sanitizeDisplayTitle (const juce::String&);
     // Title of a source file: our own export suffix ("_pad05_<hash>", "_sel_<hash>") removed, the yt-dlp id suffix
     // ("_<11 chars>") only for files in our downloads folder
     juce::String titleFromFile (const juce::File&);
@@ -71,6 +105,8 @@ namespace sg::storage
 
     // Video ids from yt-dlp probes (any thread). Only ids matching [A-Za-z0-9_-]{6,} are used for file matching.
     bool isValidVideoId (const juce::String&);
+    // "<title>_<11-char YouTube id>" (the id itself may contain '_')
+    bool hasVideoIdTail (const juce::String& name);
     void rememberVideoId (const juce::String& url, const juce::String& id);   // per process, small (oldest dropped)
     juce::String videoIdFor (const juce::String& url);
     // Whole-audio downloads in flight, per video id, process-wide: a second job for the same id waits, then reuses the file

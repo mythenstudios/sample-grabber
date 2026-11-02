@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #pragma once
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
@@ -61,6 +65,12 @@ public:
     bool installMissing();
     bool updateAll (bool force);
     bool checkForUpdates();
+    // REMOVE TOOLS: deletes only our own files in toolsDir() (yt-dlp, deno, ffmpeg, ffprobe, tools.xml, .tmp, backups),
+    // never other files there. Refused while a grab of this process runs (tryBeginExternalJob gate). The gate covers this
+    // process only: a grab in another process (DAW + Standalone) is not seen. Windows then refuses to delete the running
+    // exe ("COULD NOT REMOVE ... IN USE?" note); on POSIX the unlink succeeds and the running tool keeps its open inode.
+    bool removeOwnTools();
+    bool hasOwnFiles() const;                       // anything removeOwnTools() would delete (disk check, cheap)
     void requestAutoCheck();                        // when the editor opens; silent, at most once per 24 h
 
     bool isWorking() const noexcept                 { return working.load(); }
@@ -79,7 +89,7 @@ public:
     static int runSelfTest (const juce::String& mode);
 
 private:
-    enum class Job { none, installMissing, update, updateForce, check, autoCheck };
+    enum class Job { none, installMissing, update, updateForce, check, autoCheck, remove };
 
     struct Plan
     {
@@ -101,6 +111,8 @@ private:
 
     void doInstall (const juce::Array<Tool>& targets, juce::String& note, bool& isError, int maxWaitMs);
     void doCheck (juce::String& note, bool& isError);
+    void doRemove (juce::String& note, bool& isError);
+    static juce::Array<juce::File> ownFiles();     // existing files/folders of ours in toolsDir()
     juce::String stateSummary() const;
     bool waitForExternalJobs (int maxWaitMs);
     void releaseExternalGate();

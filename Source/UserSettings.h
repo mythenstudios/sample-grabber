@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #pragma once
 #include <juce_data_structures/juce_data_structures.h>
 #include <iostream>
@@ -35,7 +39,8 @@ namespace sg::settings
         return props.getValue (key, fallback);
     }
 
-    inline void set (const juce::String& key, const juce::String& value)
+    // false = not written (unreadable file could not be set aside, or saving failed)
+    inline bool set (const juce::String& key, const juce::String& value)
     {
         const auto f = file();
         f.getParentDirectory().createDirectory();
@@ -56,11 +61,26 @@ namespace sg::settings
                       << (moved ? bad.getFullPathName() : juce::String ("(rename failed, not written)")).toStdString()
                       << std::endl;
             if (! moved)
-                return;
+                return false;
         }
 
         juce::PropertiesFile props (f, options());
         props.setValue (key, value);
-        props.save();
+        return props.save();
+    }
+
+    // Removes a key (back to the caller's default). Missing file or key = nothing to do.
+    inline bool remove (const juce::String& key)
+    {
+        const auto f = file();
+        if (! f.existsAsFile())
+            return true;
+        juce::PropertiesFile props (f, options());
+        if (! props.isValidFile())
+            return false;   // do not touch an unreadable file here; set() sets it aside
+        if (! props.containsKey (key))
+            return true;
+        props.removeValue (key);
+        return props.save();
     }
 }

@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #pragma once
 #include "PluginProcessor.h"
 #include "IconButton.h"
@@ -8,7 +12,8 @@
 
 // Settings overlay (gear in the header): child component on top of the whole editor,
 // dimmed background (scrim) and a panel in the style of the DETECTED panel. No popup/window (WSLg).
-// Sections: APPEARANCE (theme), TOOLS (ToolManager), STORAGE (cache + exports), AUDIO (standalone only).
+// Sections: APPEARANCE (theme), TOOLS (ToolManager), STORAGE (cache, exports, tools folder), AUDIO (standalone only).
+// Folder CHANGE: inline text field in the row (no popup, WSLg); Windows/macOS also open the native folder chooser.
 // When closed the component is invisible and intercepts nothing. Message thread only.
 class SettingsOverlay : public juce::Component,
                         private juce::ChangeListener
@@ -32,7 +37,7 @@ public:
         darkButton.onClick    = [this] { if (onSetTheme) onSetTheme (ui::ThemeId::dark); };
         classicButton.onClick = [this] { if (onSetTheme) onSetTheme (ui::ThemeId::classic); };
 
-        for (auto* b : { &checkButton, &updateButton, &autoButton, &openButton, &audioButton })
+        for (auto* b : { &checkButton, &updateButton, &autoButton, &audioButton })
         {
             b->getProperties().set ("outline", true);
             addAndMakeVisible (*b);
@@ -55,16 +60,62 @@ public:
             autoButton.setButtonText (autoText());
         };
 
-        openButton.onClick = [this] { openFolder (ToolManager::toolsDir(), localNote); };
-
         // --- STORAGE ---
-        for (auto* b : { &cacheOpenButton, &cacheClearButton, &exportOpenButton })
+        for (auto* b : { &cacheOpenButton, &cacheClearButton, &exportOpenButton, &cacheChangeButton, &exportChangeButton,
+                         &toolsOpenButton, &removeToolsButton, &editBrowseButton, &editDefaultButton, &editOkButton,
+                         &editCancelButton })
         {
             b->getProperties().set ("outline", true);
             addAndMakeVisible (*b);
         }
         cacheOpenButton.onClick  = [this] { openFolder (sg::storage::cacheRoot(), storageNote); };
         exportOpenButton.onClick = [this] { openFolder (sg::storage::exportRoot(), storageNote); };
+        toolsOpenButton.onClick  = [this] { openFolder (ToolManager::toolsDir(), storageNote); };
+        cacheChangeButton.onClick  = [this] { beginEdit (sg::storage::Folder::cache); };
+        exportChangeButton.onClick = [this] { beginEdit (sg::storage::Folder::exports); };
+        editOkButton.onClick       = [this] { applyFolder (editField.getText()); };
+        editCancelButton.onClick   = [this] { endEdit(); };
+        editBrowseButton.onClick   = [this] { browseFolder(); };
+        editDefaultButton.onClick  = [this] { resetFolder(); };
+
+        editField.setMultiLine (false);
+        editField.setReturnKeyStartsNewLine (false);
+        editField.setPopupMenuEnabled (false);   // no popup menus (WSLg)
+        editField.setScrollbarsShown (false);
+        editField.setJustification (juce::Justification::centredLeft);
+        editField.setBorder (juce::BorderSize<int> (0));
+        editField.setIndents (6, 0);   // vertical centring by the justification, text level with the other rows
+        editField.onReturnKey = [this] { applyFolder (editField.getText()); };
+        editField.onEscapeKey = [this] { endEdit(); };
+        editField.onTextChange = [this] { if (storageNote.isNotEmpty()) { storageNote.clear(); repaint (storageHintR); } };
+        addChildComponent (editField);
+
+        // REMOVE TOOLS: same two-step confirm as CLEAR NOW
+        removeToolsButton.onClick = [this]
+        {
+            if (! removeArmed)
+            {
+                removeArmed = true;
+                removeToolsButton.setButtonText ("CONFIRM REMOVE?");
+                const int token = ++removeToken;
+                const juce::Component::SafePointer<SettingsOverlay> safe (this);
+                juce::Timer::callAfterDelay (3000, [safe, token]
+                {
+                    if (safe != nullptr && safe->removeToken == token)
+                        safe->disarmRemove();
+                });
+                return;
+            }
+            disarmRemove();
+            if (isGrabBusy != nullptr && isGrabBusy())
+                storageNote = "A DOWNLOAD IS RUNNING - REMOVE THE TOOLS AFTER IT";
+            else
+            {
+                storageNote.clear();
+                tools->removeOwnTools();   // result in the TOOLS status line and the main status line
+            }
+            refreshTools();
+        };
         // Two-step confirm inside the button (no popup): first click arms for 3 s, second click clears
         cacheClearButton.onClick = [this]
         {
@@ -73,7 +124,9 @@ public:
                 clearArmed = true;
                 cacheClearButton.setButtonText ("CONFIRM CLEAR?");
                 const int token = ++clearToken;
-                juce::Timer::callAfterDelay (3000, [safe = juce::Component::SafePointer<SettingsOverlay> (this), token]
+                // Built outside the capture list: MSVC rejects 'this' in an init-capture of a nested lambda
+                const juce::Component::SafePointer<SettingsOverlay> safe (this);
+                juce::Timer::callAfterDelay (3000, [safe, token]
                 {
                     if (safe != nullptr && safe->clearToken == token)
                         safe->disarmClear();
@@ -134,6 +187,7 @@ public:
 
     std::function<void()> onClose;
     std::function<void (ui::ThemeId)> onSetTheme;
+    std::function<bool()> isGrabBusy;               // editor: a grab/import of this editor runs (REMOVE TOOLS waits)
 
     // Before showing: fetch fresh state (disk state, setting, standalone yes/no)
     void prepareToShow()
@@ -147,6 +201,9 @@ public:
         localNote.clear();
         storageNote.clear();
         disarmClear();
+        disarmRemove();
+        endEdit();
+        refreshPaths();
         tools->refresh();
         refreshTools();
         const auto mode = sg::storage::getAutoClean();
@@ -156,22 +213,35 @@ public:
         resized();
     }
 
+    // SG_SNAPSHOT_SETTINGS=cache|exports (developer aid): open the folder CHANGE row (no native chooser, no saving)
+    void showFolderEditForSnapshot (bool cacheRow)
+    {
+        editing = cacheRow ? sg::storage::Folder::cache : sg::storage::Folder::exports;
+        isEditing = true;
+        editField.setText ((cacheRow ? cacheNext : exportShown).getFullPathName(), false);
+        layoutEdit();
+        repaint();
+    }
+
     // Theme changed (also by another instance): update switch and colours
     void themeChanged()
     {
         (ui::theme() == ui::ThemeId::dark ? darkButton : classicButton).setToggleState (true, juce::dontSendNotification);
+        editField.setColour (juce::TextEditor::backgroundColourId, ui::c().surface1);
+        editField.applyFontToAllText (ui::monoUi (11.0f));   // also the font for new text
+        editField.applyColourToAllText (ui::c().textPrimary);
         repaint();
     }
 
     void resized() override
     {
-        const int w = 600;
+        const int w = 600;   // wider would run into the gear button (stays on top, top right of the editor)
         const int h = 16 + 24 + 12                         // top margin, title
                     + 16 + 6 + 22 + 20                     // APPEARANCE
-                    + 16 + 6 + 3 * rowH + 8 + 22 + 6 + 16 + 8 + 22 + 20   // TOOLS
-                    + 16 + 6 + 4 * 22 + 3 * 6 + 20         // STORAGE
+                    + 16 + 6 + 3 * rowH + 8 + 22 + 6 + 16 + 20   // TOOLS
+                    + 16 + 6 + 5 * 22 + 5 * 6 + 16 + 20    // STORAGE (5 rows + note line)
                     + (hasAudio ? 16 + 6 + 22 + 20 : 0)    // AUDIO
-                    + 16 + 16;                             // licence note, bottom margin
+                    + 16 + 4 + 16 + 16;                    // licence note, about line, bottom margin
         panelR = getLocalBounds().withSizeKeepingCentre (w, h);
 
         auto r = panelR.reduced (16);
@@ -199,19 +269,20 @@ public:
         lastCheckR = br.withTrimmedLeft (12).withTrimmedRight (12);
         r.removeFromTop (6);
         toolStatusR = r.removeFromTop (16);   // running operation or last result
-        r.removeFromTop (8);
-        folderR = r.removeFromTop (22);
-        openButton.setBounds (folderR.removeFromRight (64));
         r.removeFromTop (20);
 
-        // STORAGE: [CACHE path size  OPEN CLEAR NOW] [AUTO-CLEAN OFF 7 DAYS 1 GB MAX  note] [EXPORTS path  OPEN]
+        // STORAGE: [CACHE path size  OPEN CHANGE CLEAR NOW] [AUTO-CLEAN OFF 7 DAYS 1 GB MAX  note] [DOWNLOADS KEEP]
+        //          [EXPORTS path  OPEN CHANGE] [TOOLS path  OPEN REMOVE TOOLS] [note line]
+        // Button columns line up: OPEN 56 | CHANGE 64 | CLEAR NOW 112 (REMOVE TOOLS spans CHANGE + CLEAR NOW)
         storageLabelR = r.removeFromTop (16);
         r.removeFromTop (6);
         cacheR = r.removeFromTop (22);
         cacheClearButton.setBounds (cacheR.removeFromRight (112));   // room for "CONFIRM CLEAR?"
         cacheR.removeFromRight (4);
-        cacheOpenButton.setBounds (cacheR.removeFromRight (64));
-        cacheSizeR = cacheR.removeFromRight (84).withTrimmedRight (8);
+        cacheChangeButton.setBounds (cacheR.removeFromRight (64));
+        cacheR.removeFromRight (4);
+        cacheOpenButton.setBounds (cacheR.removeFromRight (56));
+        cacheSizeR = cacheR.removeFromRight (64).withTrimmedRight (8);
         r.removeFromTop (6);
         cleanR = r.removeFromTop (22);
         {
@@ -232,8 +303,20 @@ public:
         }
         r.removeFromTop (6);
         exportR = r.removeFromTop (22);
-        exportOpenButton.setBounds (exportR.removeFromRight (64));
+        exportR.removeFromRight (112 + 4);
+        exportChangeButton.setBounds (exportR.removeFromRight (64));
+        exportR.removeFromRight (4);
+        exportOpenButton.setBounds (exportR.removeFromRight (56));
+        r.removeFromTop (6);
+        toolsR = r.removeFromTop (22);
+        removeToolsButton.setBounds (toolsR.removeFromRight (112 + 4 + 64));
+        toolsR.removeFromRight (4);
+        toolsOpenButton.setBounds (toolsR.removeFromRight (56));
+        r.removeFromTop (6);
+        storageHintR = r.removeFromTop (16);
         r.removeFromTop (20);
+
+        layoutEdit();
 
         if (hasAudio)
         {
@@ -248,6 +331,9 @@ public:
         }
 
         footerR = r.removeFromTop (16);
+        r.removeFromTop (4);
+        aboutR = r.removeFromTop (16);
+        sourceR = aboutR.withX (aboutR.getX() + (int) std::ceil (aboutPrefixWidth())).withWidth ((int) std::ceil (sourceWidth()));
     }
 
     void paint (juce::Graphics& g) override
@@ -276,25 +362,53 @@ public:
 
         paintTools (g);
 
-        // Folder
-        g.setColour (ui::c().textSecondary);
-        g.setFont (ui::label (10.0f));
-        g.drawText ("FOLDER", folderR.withWidth (labelW), juce::Justification::centredLeft);
-        g.setColour (ui::c().textPrimary);
-        g.setFont (ui::monoUi (11.0f));
-        g.drawFittedText (shortPath (ToolManager::toolsDir()), folderR.withTrimmedLeft (labelW).withTrimmedRight (8),
-                          juce::Justification::centredLeft, 1, 1.0f);
-
         paintStorage (g);
 
         g.setColour (ui::c().textTertiary);
         g.setFont (ui::label (10.0f));
         g.drawText ("TOOLS FROM OFFICIAL GITHUB RELEASES: YT-DLP (UNLICENSE / GPLV3 BINARY), DENO (MIT), FFMPEG (LGPL)",
                     footerR, juce::Justification::centredLeft);
+
+        // About line: version, copyright, licence, SOURCE link (hit area = only the word SOURCE)
+        g.setFont (ui::label (10.0f));
+        g.drawText (aboutPrefix(), aboutR, juce::Justification::centredLeft, false);
+        g.setColour (sourceHover ? ui::c().red : ui::c().textSecondary);
+        g.drawText ("SOURCE", sourceR, juce::Justification::centredLeft, false);
+        g.fillRect (sourceR.getX(), sourceR.getBottom() - 3, sourceR.getWidth(), 1);   // underline = link
+    }
+
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        const bool over = sourceR.contains (e.getPosition());
+        if (over != sourceHover)
+        {
+            sourceHover = over;
+            repaint (sourceR);
+        }
+    }
+
+    void mouseExit (const juce::MouseEvent&) override
+    {
+        if (sourceHover)
+        {
+            sourceHover = false;
+            repaint (sourceR);
+        }
+    }
+
+    juce::MouseCursor getMouseCursor() override
+    {
+        return sourceR.contains (getMouseXYRelative()) && isVisible() ? juce::MouseCursor::PointingHandCursor
+                                                                       : juce::MouseCursor::NormalCursor;
     }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
+        if (sourceR.contains (e.getPosition()))
+        {
+            juce::URL ("https://github.com/mythenstudios/sample-grabber").launchInDefaultBrowser();
+            return;
+        }
         if (! panelR.contains (e.getPosition()) && onClose)
             onClose();   // click on the scrim closes
     }
@@ -314,11 +428,191 @@ private:
 
     static constexpr int labelW = 84;   // label column of the STORAGE rows
 
+    // Plugin target: JucePlugin_VersionString, standalone target: JUCE_APPLICATION_VERSION_STRING (both from CMake VERSION)
+    static juce::String versionText()
+    {
+       #if defined (JucePlugin_VersionString)
+        return JucePlugin_VersionString;
+       #elif defined (JUCE_APPLICATION_VERSION_STRING)
+        return JUCE_APPLICATION_VERSION_STRING;
+       #else
+        return {};
+       #endif
+    }
+
+    // "SAMPLE GRABBER 0.1.0 · © MYTHEN STUDIOS · AGPL-3.0 · " (middle dot and copyright sign as UTF-8 bytes)
+    static juce::String aboutPrefix()
+    {
+        const auto dot = juce::String::fromUTF8 (" \xc2\xb7 ");
+        return "SAMPLE GRABBER " + versionText() + dot + juce::String::fromUTF8 ("\xc2\xa9") + " MYTHEN STUDIOS" + dot + "AGPL-3.0" + dot;
+    }
+
+    static float aboutPrefixWidth() { return juce::GlyphArrangement::getStringWidth (ui::label (10.0f), aboutPrefix()); }
+    static float sourceWidth()      { return juce::GlyphArrangement::getStringWidth (ui::label (10.0f), "SOURCE"); }
+
     void disarmClear()
     {
         clearArmed = false;
         ++clearToken;
         cacheClearButton.setButtonText ("CLEAR NOW");
+    }
+
+    void disarmRemove()
+    {
+        removeArmed = false;
+        ++removeToken;
+        removeToolsButton.setButtonText ("REMOVE TOOLS");
+    }
+
+    // Paths shown in STORAGE: read when opening and after a change, not on every repaint (settings.xml/registry)
+    void refreshPaths()
+    {
+        cacheShown = sg::storage::cacheRoot();
+        cacheNext = sg::storage::folderFromEnv (sg::storage::Folder::cache) ? cacheShown
+                                                                            : sg::storage::resolveFolder (sg::storage::Folder::cache);
+        exportShown = sg::storage::exportRoot();
+        cacheChangeButton.setEnabled (! sg::storage::folderFromEnv (sg::storage::Folder::cache));    // env var wins anyway
+        exportChangeButton.setEnabled (! sg::storage::folderFromEnv (sg::storage::Folder::exports));
+        repaint();
+    }
+
+    // --- Folder CHANGE: the row turns into [label][text field][BROWSE][DEFAULT][OK][CANCEL] ---
+    void beginEdit (sg::storage::Folder f)
+    {
+        disarmClear();
+        editing = f;
+        isEditing = true;
+        storageNote.clear();
+        editField.setText ((f == sg::storage::Folder::cache ? cacheNext : exportShown).getFullPathName(), false);
+        layoutEdit();
+        editField.grabKeyboardFocus();
+        editField.selectAll();
+        repaint();
+       #if JUCE_WINDOWS || JUCE_MAC
+        browseFolder();   // native chooser right away; cancelled -> the text field stays for typing/DEFAULT
+       #endif
+    }
+
+    void endEdit()
+    {
+        isEditing = false;
+        chooser.reset();
+        layoutEdit();
+        if (isShowing())
+            grabKeyboardFocus();   // Escape closes the overlay again
+        repaint();
+    }
+
+    void layoutEdit()
+    {
+        const bool editCache = isEditing && editing == sg::storage::Folder::cache;
+        const bool editExport = isEditing && editing == sg::storage::Folder::exports;
+        for (auto* b : { &cacheOpenButton, &cacheChangeButton, &cacheClearButton })
+            b->setVisible (! editCache);
+        for (auto* b : { &exportOpenButton, &exportChangeButton })
+            b->setVisible (! editExport);
+        editField.setVisible (isEditing);
+       #if JUCE_WINDOWS || JUCE_MAC
+        editBrowseButton.setVisible (isEditing);
+       #else
+        editBrowseButton.setVisible (false);
+       #endif
+        for (auto* b : { &editDefaultButton, &editOkButton, &editCancelButton })
+            b->setVisible (isEditing);
+        if (! isEditing)
+            return;
+
+        // Whole row right of the label (the cache size column too)
+        auto row = (editCache ? cacheR.withRight (cacheClearButton.getRight()) : exportR.withRight (cacheClearButton.getRight()))
+                       .withTrimmedLeft (labelW);
+        editCancelButton.setBounds (row.removeFromRight (64));
+        row.removeFromRight (4);
+        editOkButton.setBounds (row.removeFromRight (40));
+        row.removeFromRight (4);
+        editDefaultButton.setBounds (row.removeFromRight (68));
+        row.removeFromRight (4);
+        if (editBrowseButton.isVisible())
+        {
+            editBrowseButton.setBounds (row.removeFromRight (68));
+            row.removeFromRight (4);
+        }
+        editR = row.withTrimmedRight (8);
+        editField.setBounds (editR.reduced (1));
+    }
+
+    void applyFolder (const juce::String& typed)
+    {
+        if (! isEditing)
+            return;
+        const auto f = editing;
+        juce::File dir;
+        const auto r = sg::storage::checkChosenFolder (f, typed, dir);
+        if (r.failed())
+        {
+            storageNote = r.getErrorMessage();
+            repaint();
+            return;
+        }
+        if (! sg::storage::setStoredFolder (f, dir.getFullPathName()))
+        {
+            storageNote = "COULD NOT SAVE THE SETTING";
+            repaint();
+            return;
+        }
+        endEdit();
+        refreshPaths();
+        if (f == sg::storage::Folder::exports)
+            storageNote = "EXPORT FOLDER CHANGED - NEW DRAGS GO THERE";
+        else if (dir != cacheShown)
+            storageNote = dir.getParentDirectory() != juce::File (typed.trim().unquoted().trim())
+                              ? "CACHE FOLDER SAVED - APPLIES AFTER A RESTART"
+                              : "FOLDER NOT EMPTY - USING A SUBFOLDER, APPLIES AFTER A RESTART";
+        repaint();
+    }
+
+    void resetFolder()
+    {
+        if (! isEditing)
+            return;
+        const auto f = editing;
+        if (! sg::storage::setStoredFolder (f, {}))
+        {
+            storageNote = "COULD NOT SAVE THE SETTING";
+            repaint();
+            return;
+        }
+        endEdit();
+        refreshPaths();
+        storageNote = f == sg::storage::Folder::exports ? juce::String ("EXPORT FOLDER BACK TO DEFAULT")
+                    : cacheNext != cacheShown ? juce::String ("CACHE BACK TO DEFAULT AFTER A RESTART")
+                                              : juce::String ("CACHE FOLDER IS THE DEFAULT");
+        repaint();
+    }
+
+    // Native folder chooser (Windows/macOS). Picking a folder applies it at once.
+    void browseFolder()
+    {
+        if (! isEditing)
+            return;
+        auto start = juce::File::isAbsolutePath (editField.getText().trim()) ? juce::File (editField.getText().trim()) : juce::File();
+        while (start != juce::File() && ! start.isDirectory() && start.getParentDirectory() != start)
+            start = start.getParentDirectory();
+        chooser = std::make_unique<juce::FileChooser> (editing == sg::storage::Folder::cache ? "Choose the cache folder"
+                                                                                             : "Choose the export folder",
+                                                       start);
+        const juce::Component::SafePointer<SettingsOverlay> safe (this);
+        chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+                              [safe] (const juce::FileChooser& fc)
+                              {
+                                  if (safe == nullptr)
+                                      return;
+                                  const auto picked = fc.getResult();
+                                  if (picked != juce::File())
+                                  {
+                                      safe->editField.setText (picked.getFullPathName(), false);
+                                      safe->applyFolder (picked.getFullPathName());
+                                  }
+                              });
     }
 
     void changeListenerCallback (juce::ChangeBroadcaster* source) override
@@ -393,7 +687,14 @@ private:
             repaint();
         }
        #else
-        dir.startAsProcess();
+        // Windows: ShellExecute with the default verb opens the folder itself in Explorer (revealToUser would select it
+        // inside its parent). macOS: opens in Finder.
+        if (! dir.startAsProcess())
+        {
+            juce::SystemClipboard::copyTextToClipboard (dir.getFullPathName());
+            note = "COULD NOT OPEN FOLDER - PATH COPIED";
+            repaint();
+        }
        #endif
     }
 
@@ -402,6 +703,7 @@ private:
         const bool working = tools->isWorking();
         checkButton.setEnabled (! working);
         updateButton.setEnabled (! working);
+        removeToolsButton.setEnabled (! working && tools->hasOwnFiles());
         updateButton.setButtonText (tools->anyMissing() ? "INSTALL" : "UPDATE");
         repaint();
     }
@@ -417,15 +719,45 @@ private:
     }
 
 
+    // Long paths lose their start, not their end (the last folders are the telling part): ".../SampleGrabber/cache"
+    static juce::String elideStart (const juce::Font& font, const juce::String& text, float maxW)
+    {
+        if (juce::GlyphArrangement::getStringWidth (font, text) <= maxW)
+            return text;
+        int lo = 1, hi = text.length();   // number of leading characters to drop
+        while (lo < hi)
+        {
+            const int mid = (lo + hi) / 2;
+            if (juce::GlyphArrangement::getStringWidth (font, "..." + text.substring (mid)) <= maxW)
+                hi = mid;
+            else
+                lo = mid + 1;
+        }
+        return "..." + text.substring (lo);
+    }
+
     static juce::String shortPath (const juce::File& f)
     {
         auto p = f.getFullPathName();
-       #if ! JUCE_WINDOWS
         const auto home = juce::File::getSpecialLocation (juce::File::userHomeDirectory).getFullPathName();
+       #if JUCE_WINDOWS
+        // Case-insensitive, backslash separator
+        if (home.length() > 1 && (p.equalsIgnoreCase (home) || p.startsWithIgnoreCase (home + "\\")))
+            p = "~" + p.substring (home.length());
+       #else
         if (home.length() > 1 && (p == home || p.startsWith (home + "/")))
             p = "~" + p.substring (home.length());
        #endif
         return p;
+    }
+
+    void paintEditRow (juce::Graphics& g, const char* label, juce::Rectangle<int> row)
+    {
+        g.setColour (ui::c().textSecondary);
+        g.setFont (ui::label (10.0f));
+        g.drawText (label, row.removeFromLeft (labelW), juce::Justification::centredLeft);
+        g.setColour (editField.hasKeyboardFocus (true) ? ui::c().hairlineStrong : ui::c().hairline);
+        g.drawRect (editR, 1);
     }
 
     void paintStorage (juce::Graphics& g)
@@ -437,26 +769,54 @@ private:
             g.drawText (label, row.removeFromLeft (labelW), juce::Justification::centredLeft);
             g.setColour (ui::c().textPrimary);
             g.setFont (ui::monoUi (11.0f));
-            g.drawFittedText (shortPath (dir), row.withTrimmedRight (8), juce::Justification::centredLeft, 1, 1.0f);
+            const auto pr = row.withTrimmedRight (8);
+            g.drawText (elideStart (ui::monoUi (11.0f), shortPath (dir), (float) pr.getWidth()), pr,
+                        juce::Justification::centredLeft, false);
         };
 
-        pathRow ("CACHE", cacheR, sg::storage::cacheRoot());
-        pathRow ("EXPORTS", exportR, sg::storage::exportRoot());
+        const bool editCache = isEditing && editing == sg::storage::Folder::cache;
+        const bool editExport = isEditing && editing == sg::storage::Folder::exports;
+        if (editCache)
+            paintEditRow (g, "CACHE", cacheR);
+        else
+            pathRow ("CACHE", cacheR, cacheShown);
+        if (editExport)
+            paintEditRow (g, "EXPORTS", exportR);
+        else
+            pathRow ("EXPORTS", exportR, exportShown);
+        pathRow ("TOOLS", toolsR, ToolManager::toolsDir());
+
+        // Note line: result of CHANGE/OPEN/REMOVE, otherwise a pending cache folder, otherwise where the folders come from
+        juce::String hint = storageNote;
+        bool hintIsError = false;
+        if (hint.isNotEmpty())
+            hintIsError = hint.startsWith ("NOT ") || hint.startsWith ("CANNOT") || hint.startsWith ("COULD NOT")
+                       || hint.startsWith ("NEEDS") || hint.startsWith ("THIS IS") || hint.startsWith ("ENTER")
+                       || hint.startsWith ("A DOWNLOAD");
+        else if (cacheNext != cacheShown)
+            hint = "AFTER A RESTART THE CACHE IS " + shortPath (cacheNext) + " (OLD FILES STAY)";
+        else if (isEditing)
+            hint = editing == sg::storage::Folder::cache ? "CACHE: NEW, EMPTY FOLDER - APPLIES AFTER A RESTART"
+                                                         : "EXPORTS: DAW PROJECTS KEEP POINTING TO THE OLD FILES";
+        g.setColour (hintIsError ? ui::c().red : ui::c().textSecondary);
+        g.setFont (ui::monoUi (10.0f));
+        g.drawFittedText (hint, storageHintR.withTrimmedLeft (labelW), juce::Justification::centredLeft, 1, 1.0f);
 
         const auto bytes = cache->getSize();
-        g.setColour (cache->isBusy() ? ui::c().textSecondary : ui::c().textPrimary);
-        g.setFont (ui::monoUi (11.0f));
-        g.drawText (cache->isBusy() || bytes < 0 ? juce::String ("...") : sg::storage::formatBytes (bytes),
-                    cacheSizeR, juce::Justification::centredRight);
+        if (! editCache)
+        {
+            g.setColour (cache->isBusy() ? ui::c().textSecondary : ui::c().textPrimary);
+            g.setFont (ui::monoUi (11.0f));
+            g.drawText (cache->isBusy() || bytes < 0 ? juce::String ("...") : sg::storage::formatBytes (bytes),
+                        cacheSizeR, juce::Justification::centredRight);
+        }
 
         g.setColour (ui::c().textSecondary);
         g.setFont (ui::label (10.0f));
         g.drawText ("AUTO-CLEAN", cleanR.withWidth (labelW), juce::Justification::centredLeft);
 
-        // Note: OPEN fallback, otherwise last clean result, otherwise what the mode does
-        juce::String note = storageNote;
-        if (note.isEmpty())
-            note = cache->getLastNote();
+        // Note: last clean result, otherwise what the mode does
+        juce::String note = cache->getLastNote();
         if (note.isEmpty())
             note = cleanMaxButton.getToggleState() ? "OLDEST FIRST, LOADED FILES KEPT"
                  : clean7Button.getToggleState()   ? "UNUSED FOR 7 DAYS, LOADED FILES KEPT"
@@ -600,20 +960,30 @@ private:
     juce::TextButton darkButton { "DARK" }, classicButton { "CLASSIC" };
     juce::TextButton checkButton { "CHECK NOW" }, updateButton { "UPDATE" };
     juce::TextButton autoButton { "AUTO-UPDATE YT-DLP: ON" };
-    juce::TextButton openButton { "OPEN" };
     juce::TextButton audioButton { "AUDIO / MIDI SETUP" };
     juce::TextButton cacheOpenButton { "OPEN" }, cacheClearButton { "CLEAR NOW" }, exportOpenButton { "OPEN" };
+    juce::TextButton cacheChangeButton { "CHANGE" }, exportChangeButton { "CHANGE" };
+    juce::TextButton toolsOpenButton { "OPEN" }, removeToolsButton { "REMOVE TOOLS" };
+    juce::TextButton editBrowseButton { "BROWSE" }, editDefaultButton { "DEFAULT" }, editOkButton { "OK" }, editCancelButton { "CANCEL" };
+    juce::TextEditor editField;                     // folder path while CHANGE is open (one row at a time)
+    std::unique_ptr<juce::FileChooser> chooser;     // native folder chooser (Windows/macOS), alive while open
+    sg::storage::Folder editing = sg::storage::Folder::exports;
+    bool isEditing = false;
+    juce::File cacheShown, cacheNext, exportShown;  // active cache, cache after a restart, export folder
+    bool removeArmed = false;                       // REMOVE TOOLS clicked once, waiting for the confirm click
+    int removeToken = 0;
     juce::TextButton cleanOffButton { "OFF" }, clean7Button { "7 DAYS" }, cleanMaxButton { "1 GB MAX" };
     juce::TextButton keepButton { "KEEP: ON" };
-    juce::String storageNote;                       // OPEN fallback note in the STORAGE section
+    juce::String storageNote;                       // note line of the STORAGE section (OPEN fallback, CHANGE, REMOVE)
     bool clearArmed = false;                        // CLEAR NOW clicked once, waiting for the confirm click
     int clearToken = 0;                             // invalidates pending disarm timers
 
     bool hasAudio = false;
     juce::String localNote;                         // note from the overlay itself (OPEN), until the next tool event
     std::unique_ptr<juce::ChildProcess> opener;     // xdg-open; object stays until the next click (no kill)
-    juce::Rectangle<int> panelR, titleR, appLabelR, toolsLabelR, rowsR, toolStatusR, lastCheckR, folderR, audioLabelR, footerR;
-    juce::Rectangle<int> storageLabelR, cacheR, cacheSizeR, cleanR, cleanNoteR, keepR, keepNoteR, exportR;
+    juce::Rectangle<int> panelR, titleR, appLabelR, toolsLabelR, rowsR, toolStatusR, lastCheckR, audioLabelR, footerR, aboutR, sourceR;
+    bool sourceHover = false;
+    juce::Rectangle<int> storageLabelR, cacheR, cacheSizeR, cleanR, cleanNoteR, keepR, keepNoteR, exportR, toolsR, storageHintR, editR;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SettingsOverlay)
 };

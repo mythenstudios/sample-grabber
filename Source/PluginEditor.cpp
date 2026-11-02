@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #include "PluginEditor.h"
 #include "BinaryData.h"
 #include <cmath>
@@ -17,20 +21,57 @@ namespace
     bool isNative (const juce::File& f)  { return kNativeExts.contains (f.getFileExtension().toLowerCase()); }
     bool isConvert (const juce::File& f) { return kConvertExts.contains (f.getFileExtension().toLowerCase()); }
 
+    // Upper case without the C runtime locale (towupper in the "C" locale may map ASCII only, e.g. on MSVC).
+    // Covers Latin-1, Latin Extended-A, basic Greek and Cyrillic; sharp s (U+00DF) stays as it is. Anything else
+    // goes through JUCE's towupper.
+    juce::juce_wchar upperChar (juce::juce_wchar c)
+    {
+        if (c < 0x80)
+            return c >= 'a' && c <= 'z' ? c - 0x20 : c;
+        if (c >= 0xE0 && c <= 0xFE && c != 0xF7)              return c - 0x20;   // a grave .. thorn
+        if (c == 0xFF)                                         return 0x178;      // y diaeresis
+        if (c >= 0x100 && c <= 0x137)                          return c == 0x131 ? (juce::juce_wchar) 'I' : (c & ~(juce::juce_wchar) 1);   // pairs upper even
+        if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E))
+            return (c & 1) == 0 ? c - 1 : c;                                          // pairs upper odd
+        if (c >= 0x14A && c <= 0x177)                          return c & ~(juce::juce_wchar) 1;
+        if (c == 0x17F)                                        return 'S';        // long s
+        if (c >= 0x3B1 && c <= 0x3C9)                          return c == 0x3C2 ? (juce::juce_wchar) 0x3A3 : c - 0x20;   // Greek, final sigma
+        if (c >= 0x430 && c <= 0x44F)                          return c - 0x20;   // Cyrillic a .. ya
+        if (c >= 0x450 && c <= 0x45F)                          return c - 0x50;   // Cyrillic ie grave .. dzhe
+        if (c < 0x250)
+            return c;                                                             // other Latin up to Extended-B: left as is
+        return juce::CharacterFunctions::toUpperCase (c);
+    }
+
+    juce::String upperDisplay (const juce::String& s)
+    {
+        std::vector<juce::juce_wchar> buf;
+        buf.reserve ((size_t) s.length() + 1);
+        for (auto p = s.getCharPointer(); ! p.isEmpty();)
+            buf.push_back (upperChar (p.getAndAdvance()));
+        buf.push_back (0);
+        return juce::String (juce::CharPointer_UTF32 (buf.data()));
+    }
+
+    // Range tag of a cache file name ("_r<from>-<to>") -> " (1:02:00-1:05:30)", empty without a tag
+    juce::String rangeSuffix (const sg::range::Range& r)
+    {
+        if (! r.set)
+            return {};
+        return " (" + sg::range::formatTime (r.from) + "-"
+               + (r.hasEnd() ? sg::range::formatTime (r.to) : juce::String ("END")) + ")";
+    }
+
     // yt-dlp appends "_<11-char-ID>" and replaces spaces with "_"; cache files of a section carry "_r<from>-<to>"
-    // -> "TITLE (1:02:00-1:05:30)"
-    juce::String prettyName (const juce::File& f)
+    // -> "TITLE (1:02:00-1:05:30)". displayTitle (real title of a link) replaces the name taken from the file.
+    juce::String prettyName (const juce::File& f, const juce::String& displayTitle = {})
     {
         sg::range::Range r;
         auto n = sg::storage::stripRangeTag (f, &r);
-        const int us = n.lastIndexOfChar ('_');
-        if (us > 0 && n.length() - us - 1 == 11)
-            n = n.substring (0, us);
-        auto out = n.replaceCharacter ('_', ' ').toUpperCase();
-        if (r.set)
-            out << " (" << sg::range::formatTime (r.from) << "-"
-                << (r.hasEnd() ? sg::range::formatTime (r.to) : juce::String ("END")) << ")";
-        return out;
+        if (sg::storage::hasVideoIdTail (n))
+            n = n.substring (0, n.length() - 12);
+        const auto shown = displayTitle.trim();
+        return upperDisplay (shown.isNotEmpty() ? shown : n.replaceCharacter ('_', ' ')) + rangeSuffix (r);
     }
 
     // Length and bit depth from the header of a JUCE-readable file (cheap, no audio read)
@@ -224,6 +265,7 @@ SampleGrabberEditor::SampleGrabberEditor (SampleGrabberProcessor& p)
     // Add the settings overlay last (on top of everything), closed at start
     settings.onClose = [this] { showSettings (false); };
     settings.onSetTheme = [this] (ui::ThemeId id) { setThemeFromSettings (id); };
+    settings.isGrabBusy = [this] { return downloader.isBusy(); };
     addChildComponent (settings);
 
     setSize (720, 600);
@@ -298,9 +340,17 @@ SampleGrabberEditor::SampleGrabberEditor (SampleGrabberProcessor& p)
                     safe->grabOrConfirm();
             });
 
-        // SG_SNAPSHOT_SETTINGS=1: show the settings overlay open
-        if (juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT_SETTINGS", {}).isNotEmpty())
+        // SG_SNAPSHOT_TITLE=<UTF-8>: display title for the file loaded via SG_SNAPSHOT_FILE (like the title of a link)
+        snapshotTitle = juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT_TITLE", {});
+
+        // SG_SNAPSHOT_SETTINGS=1: show the settings overlay open (=cache|exports: with that folder row in CHANGE mode)
+        const auto snapSettings = juce::SystemStats::getEnvironmentVariable ("SG_SNAPSHOT_SETTINGS", {});
+        if (snapSettings.isNotEmpty())
+        {
             showSettings (true);
+            if (snapSettings == "cache" || snapSettings == "exports")
+                settings.showFolderEditForSnapshot (snapSettings == "cache");
+        }
     }
 
     startTimerHz (30);
@@ -461,9 +511,10 @@ std::function<void (Downloader::Result)> SampleGrabberEditor::doneCallback()
         {
             const auto url = std::exchange (safe->pendingGrabUrl, juce::String());
             const auto range = std::exchange (safe->pendingGrabRange, juce::String());
+            const auto title = std::exchange (safe->pendingGrabTitle, juce::String());
             // Already used by another instance or a BACK entry here (same link grabbed again): never delete it
             const bool shared = sg::storage::isInUse (r.file);
-            const bool loaded = safe->loadFromFile (r.file, url, range);
+            const bool loaded = safe->loadFromFile (r.file, url, range, title);
 
             // KEEP DOWNLOADS off: the sample is in RAM and nothing reads the file again (BACK keeps buffers,
             // staging/state/waveform work from RAM). Deleted by the timer once the embedded FLAC is cached
@@ -481,6 +532,7 @@ std::function<void (Downloader::Result)> SampleGrabberEditor::doneCallback()
         {
             safe->pendingGrabUrl.clear();
             safe->pendingGrabRange.clear();
+            safe->pendingGrabTitle.clear();
             safe->showToolError (r.message);
         }
     };
@@ -515,6 +567,8 @@ std::function<void (Downloader::Result)> SampleGrabberEditor::probeCallback (con
         }
 
         spec.duration = r.duration;
+        if (spec.isUrl)
+            spec.title = r.title;
         if (r.title.isNotEmpty())
             std::fprintf (stderr, "[SG] probe: %s -> %s, '%s'\n", (spec.isUrl ? spec.url : spec.file.getFullPathName()).toRawUTF8(),
                           r.duration >= 0.0 ? sg::range::formatTime (r.duration).toRawUTF8() : "unknown", r.title.toRawUTF8());
@@ -647,6 +701,7 @@ void SampleGrabberEditor::cancelJob (const juce::String& status, bool error)
     busy = false;
     pendingGrabUrl.clear();
     pendingGrabRange.clear();
+    pendingGrabTitle.clear();
     grabNote.clear();
     statusText = status;
     isError = error;
@@ -774,6 +829,7 @@ void SampleGrabberEditor::proceedGrab (const GrabSpec& spec)
     {
         pendingGrabUrl = spec.url;
         pendingGrabRange = rangeText;
+        pendingGrabTitle = spec.title;
         beginBusy (spec.range.set ? "DOWNLOADING RANGE" : "STARTING");
         downloader.grab (spec.url, spec.range, spec.duration, ! sg::storage::getKeepDownloads(), progressCallback(), doneCallback());
         updateFetchLabel();
@@ -790,6 +846,7 @@ void SampleGrabberEditor::proceedGrab (const GrabSpec& spec)
     // Conversion and/or cut via ffmpeg into the cache; the original path is kept as the source (RE-GRAB, state)
     pendingGrabUrl = spec.file.getFullPathName();
     pendingGrabRange = rangeText;
+    pendingGrabTitle.clear();
     beginBusy ("CONVERTING");
     downloader.importFile (spec.file, spec.range, spec.native ? spec.bits : 16, progressCallback(), doneCallback());
     updateFetchLabel();
@@ -894,14 +951,16 @@ void SampleGrabberEditor::startGrab()
     }
 }
 
-bool SampleGrabberEditor::loadFromFile (const juce::File& f, const juce::String& sourceUrl, const juce::String& sourceRange)
+bool SampleGrabberEditor::loadFromFile (const juce::File& f, const juce::String& sourceUrl, const juce::String& sourceRange,
+                                        const juce::String& displayTitle)
 {
-    const bool ok = processor.loadSample (f, true, sourceUrl, sourceRange);
+    const bool ok = processor.loadSample (f, true, sourceUrl, sourceRange,
+                                          displayTitle.isNotEmpty() ? displayTitle : snapshotTitle);
     if (ok)
     {
         waveform.resetView();
         pads.refreshThumbs();
-        statusText = "READY" + kDot + prettyName (f);
+        statusText = "READY" + kDot + loadedName();
         isError = false;
         progress = 1.0f;
     }
@@ -913,6 +972,12 @@ bool SampleGrabberEditor::loadFromFile (const juce::File& f, const juce::String&
     }
     repaint();
     return ok;
+}
+
+// Message thread: display title under the processor's metaLock (getDisplayTitle), else the name from the file
+juce::String SampleGrabberEditor::loadedName() const
+{
+    return prettyName (processor.getLoadedFile(), processor.getDisplayTitle());
 }
 
 void SampleGrabberEditor::syncSliceModeButtons()
@@ -951,7 +1016,7 @@ void SampleGrabberEditor::applyRestoredState()
     }
     else if (processor.hasSample())
     {
-        statusText = "READY" + kDot + prettyName (processor.getLoadedFile());
+        statusText = "READY" + kDot + loadedName();
         isError = false;
         progress = 1.0f;
         fillSourceFields();
@@ -971,7 +1036,7 @@ void SampleGrabberEditor::goBack()
     pads.refreshThumbs();
     syncSliceModeButtons();
     fillSourceFields();   // link + range of the sample BACK returned to (RE-GRAB fetches that one)
-    statusText = "READY" + kDot + prettyName (processor.getLoadedFile());
+    statusText = "READY" + kDot + loadedName();
     isError = false;
     progress = 1.0f;
     repaint();
@@ -1583,7 +1648,7 @@ void SampleGrabberEditor::paint (juce::Graphics& g)
 
         g.setColour (has ? ui::c().textPrimary : ui::c().textSecondary);
         g.setFont (ui::strong (11.0f));
-        g.drawFittedText (has ? prettyName (processor.getLoadedFile()) : kDash, nameR, juce::Justification::topLeft, 2);
+        g.drawFittedText (has ? loadedName() : kDash, nameR, juce::Justification::topLeft, 2);
 
         const int rowH = inner.getHeight() / 4;
         auto row = [&] (int idx, const juce::String& k, const juce::String& v, bool dim)
