@@ -728,18 +728,18 @@ namespace
                               100.0 * bandMass[0] / tot, 100.0 * bandMass[1] / tot, 100.0 * bandMass[2] / tot,
                               100.0 * bandMass[3] / tot, 100.0 * bandMass[4] / tot);
 
-            std::array<int, 24> order {};
+            std::array<int, 24> ranked {};
             for (int i = 0; i < 24; ++i)
-                order[(size_t) i] = i;
-            std::sort (order.begin(), order.end(), [&] (int p, int q) { return allCorr[(size_t) p] > allCorr[(size_t) q]; });
+                ranked[(size_t) i] = i;
+            std::sort (ranked.begin(), ranked.end(), [&] (int p, int q) { return allCorr[(size_t) p] > allCorr[(size_t) q]; });
             for (int i = 0; i < 5; ++i)
             {
-                const int kk = order[(size_t) i];
+                const int kk = ranked[(size_t) i];
                 std::fprintf (stderr, "[SG-KEY]   #%d %s %s  r=%.3f\n", i + 1, pcNames[kk % 12], kk >= 12 ? "min" : "maj", allCorr[(size_t) kk]);
             }
         }
 
-        if (kKeyVariant > 0)
+        if constexpr (kKeyVariant > 0)
         {
             std::array<std::array<double, 12>, 3> var {};
             int used = 0;

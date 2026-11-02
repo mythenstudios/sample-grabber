@@ -352,11 +352,11 @@ namespace selftest
         {
             juce::MemoryBlock t (st);
             const juce::int64 huge = std::numeric_limits<juce::int64>::max();
-            t.copyFrom (&huge, chunkPos + 4, sizeof (huge));
+            t.copyFrom (&huge, (int) (chunkPos + 4), sizeof (huge));
             auto p = restore ("G huge length", t);
             expect (! p->hasSample(), "G huge length ignored");
             const juce::int64 neg = -5;
-            t.copyFrom (&neg, chunkPos + 4, sizeof (neg));
+            t.copyFrom (&neg, (int) (chunkPos + 4), sizeof (neg));
             auto q = restore ("G negative length", t);
             expect (! q->hasSample(), "G negative length ignored");
         }
@@ -368,7 +368,7 @@ namespace selftest
             auto p = restore ("H corrupt FLAC frames", t);
             expect (p->getNumSamples() == 0 || p->getNumSamples() == selLen, "H no garbage length");
             juce::MemoryBlock u (st);
-            u.copyFrom ("XXXX", chunkPos + 12, 4);   // "fLaC" magic destroyed
+            u.copyFrom ("XXXX", (int) (chunkPos + 12), 4);   // "fLaC" magic destroyed
             auto q = restore ("H corrupt FLAC header", u);
             expect (! q->hasSample() && q->getRestoreNote() == "SOURCE MISSING - NO SAVED AUDIO", "H bad header rejected");
         }
@@ -726,9 +726,9 @@ namespace selftest
             juce::Array<juce::File> dirs { ToolManager::toolsDir() };
             {
                 juce::SharedResourcePointer<ToolManager> tm;
-                for (const auto t : { ToolManager::Tool::ytdlp, ToolManager::Tool::ffmpeg, ToolManager::Tool::deno })
+                for (const auto tool : { ToolManager::Tool::ytdlp, ToolManager::Tool::ffmpeg, ToolManager::Tool::deno })
                 {
-                    const auto exe = tm->getExecutable (t);
+                    const auto exe = tm->getExecutable (tool);
                     if (exe != juce::File())
                         dirs.addIfNotAlreadyThere (exe.getParentDirectory());
                 }

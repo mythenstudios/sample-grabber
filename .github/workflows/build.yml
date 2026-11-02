@@ -3,6 +3,12 @@ name: build
 on:
   push:
     branches: [main, "win/**"]
+    # Docs-only pushes (README, screenshots, badges) need no build
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".github/assets/**"
+      - ".github/FUNDING.yml"
   workflow_dispatch:
 
 permissions:
@@ -19,7 +25,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -40,7 +46,7 @@ jobs:
           Get-ChildItem -Recurse -Force $out | Select-Object FullName, Length | Format-Table -AutoSize
           "PKG=$out" >> $env:GITHUB_ENV
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sample-grabber-windows-x64
           path: ${{ env.PKG }}
@@ -67,7 +73,7 @@ jobs:
           $setup = Get-ChildItem dist\setup\*.exe | Select-Object -First 1
           "SETUP=$($setup.FullName)" >> $env:GITHUB_ENV
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sample-grabber-windows-x64-setup
           path: ${{ env.SETUP }}
@@ -84,7 +90,7 @@ jobs:
         shell: pwsh
         run: ./scripts/ci/selftests.ps1 -App "build/SampleGrabberApp_artefacts/Release/Sample Grabber.exe" -Work "${{ runner.temp }}/sg-selftest"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: selftest-windows-x64
@@ -97,7 +103,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Dependencies
         run: |
