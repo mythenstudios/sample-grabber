@@ -91,7 +91,7 @@ namespace sg::storage
     juce::File appDataDir()
     {
         // Same folder as settings.xml and audio.xml
-        return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory).getChildFile ("SampleGrabber");
+        return sg::settings::appDataRoot();
     }
 
     juce::File defaultFolder (Folder f)
@@ -334,7 +334,8 @@ namespace sg::storage
             whyNot = "home folder";
         else if (same (root, music))
             whyNot = "music folder";
-        else if (same (root, appDataDir()) || same (root, juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory))
+        else if (same (root, appDataDir()) || same (root, appDataDir().getParentDirectory())
+                 || same (root, juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory))
                 #if JUCE_WINDOWS
                  || same (root, juce::File::getSpecialLocation (juce::File::windowsLocalAppData))
                  || same (root, juce::File::getSpecialLocation (juce::File::windowsLocalAppData).getChildFile ("SampleGrabber"))

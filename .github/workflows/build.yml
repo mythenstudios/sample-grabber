@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main, "win/**"]
+    branches: [main, "win/**", "mac/**"]
     # Docs-only pushes (README, screenshots, badges) need no build
     paths-ignore:
       - "**.md"
@@ -118,3 +118,79 @@ jobs:
 
       - name: Build
         run: cmake --build build --target SampleGrabber_VST3 SampleGrabberApp
+
+  # Apple Silicon: standalone app, VST3 and AU, ad-hoc signed (no Apple developer account yet)
+  macos-arm64:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
+
+      - name: Build
+        run: cmake --build build --target SampleGrabber_VST3 SampleGrabber_AU SampleGrabberApp
+
+      # Ninja builds carry only the linker's ad-hoc signature on the binary; sign the whole bundles (Info.plist, resources)
+      - name: Ad-hoc sign
+        run: |
+          set -euo pipefail
+          for b in "build/SampleGrabberApp_artefacts/Release/Sample Grabber.app" \
+                   "build/SampleGrabber_artefacts/Release/VST3/Sample Grabber.vst3" \
+                   "build/SampleGrabber_artefacts/Release/AU/Sample Grabber.component"; do
+            codesign --force --deep -s - "$b"
+          done
+
+      # The bundles go into a zip made with ditto: upload-artifact drops the executable bits and symlinks
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="sample-grabber-${GITHUB_SHA::7}-macos-arm64"
+          out="dist/$name"
+          mkdir -p "$out"
+          cp -R "build/SampleGrabberApp_artefacts/Release/Sample Grabber.app" "$out/"
+          cp -R "build/SampleGrabber_artefacts/Release/VST3/Sample Grabber.vst3" "$out/"
+          cp -R "build/SampleGrabber_artefacts/Release/AU/Sample Grabber.component" "$out/"
+          cp LICENSE scripts/mac-test.sh "$out/"
+          echo "$GITHUB_SHA" > "$out/BUILD.txt"
+          for b in "$out/Sample Grabber.app" "$out/Sample Grabber.vst3" "$out/Sample Grabber.component"; do
+            codesign --verify --deep --strict "$b"
+            codesign -dv "$b" 2>&1 | grep -E 'Identifier|Signature' || true
+          done
+          lipo -archs "$out/Sample Grabber.app/Contents/MacOS/Sample Grabber"
+          (cd dist && ditto -c -k --keepParent "$name" "$name.zip")
+          ls -la dist
+          echo "PKGZIP=dist/$name.zip" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sample-grabber-macos-arm64
+          path: ${{ env.PKGZIP }}
+          retention-days: 14
+
+      # Logic only loads AUs that pass Apple's validator. Not blocking yet: first find out whether auval runs reliably on CI
+      - name: AU validation
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R "build/SampleGrabber_artefacts/Release/AU/Sample Grabber.component" ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 3
+          auval -a | grep -i "Sgrb" || true
+          auval -v aumu Sgrb Wrst
+
+      # No tool installer on macOS yet: skip the tests that need yt-dlp/ffmpeg (proc skips itself off Windows)
+      - name: Self tests
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./scripts/ci/selftests.ps1 -App "build/SampleGrabberApp_artefacts/Release/Sample Grabber.app/Contents/MacOS/Sample Grabber" -Work "${{ runner.temp }}/sg-selftest" -Skip tools,grab-file,grab-range
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: selftest-macos-arm64
+          path: ${{ runner.temp }}/sg-selftest/out
+          retention-days: 7
+          if-no-files-found: ignore

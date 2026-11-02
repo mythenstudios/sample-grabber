@@ -11,11 +11,21 @@
 // Cross-process via InterProcessLock (VST3 and standalone at the same time). Message thread.
 namespace sg::settings
 {
+    // Per-user data folder for settings.xml, audio.xml, cache and (except Windows) tools.
+    // Linux ~/.config/SampleGrabber, Windows %APPDATA%\SampleGrabber, macOS ~/Library/Application Support/SampleGrabber
+    // (JUCE's userApplicationDataDirectory is plain ~/Library on macOS).
+    inline juce::File appDataRoot()
+    {
+        auto base = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory);
+       #if JUCE_MAC
+        base = base.getChildFile ("Application Support");
+       #endif
+        return base.getChildFile ("SampleGrabber");
+    }
+
     inline juce::File file()
     {
-        // Same folder as Downloader::dataDir and audio.xml of the standalone app
-        return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                   .getChildFile ("SampleGrabber").getChildFile ("settings.xml");
+        return appDataRoot().getChildFile ("settings.xml");
     }
 
     inline juce::PropertiesFile::Options options()

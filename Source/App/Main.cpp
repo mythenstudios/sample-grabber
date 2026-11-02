@@ -8,6 +8,7 @@
 #include "AudioSettingsPanel.h"
 #include "Downloader.h"
 #include "TimeRange.h"
+#include "UserSettings.h"
 #include <cmath>
 #include <cstdlib>
 #include <functional>
@@ -60,8 +61,7 @@ public:
         setUsingNativeTitleBar (false);
         setTitleBarHeight (34);
 
-        settingsFile = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                           .getChildFile ("SampleGrabber").getChildFile ("audio.xml");
+        settingsFile = sg::settings::appDataRoot().getChildFile ("audio.xml");
         auto saved = juce::parseXML (settingsFile);
 
         processor = std::make_unique<SampleGrabberProcessor>();

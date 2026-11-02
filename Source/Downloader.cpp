@@ -12,6 +12,7 @@
 #if JUCE_LINUX || JUCE_MAC || JUCE_BSD
  #include <fcntl.h>
  #include <sys/stat.h>
+ #include <unistd.h>
 #endif
 
 #if JUCE_LINUX

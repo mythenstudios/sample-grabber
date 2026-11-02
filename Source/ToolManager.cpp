@@ -219,11 +219,10 @@ juce::File ToolManager::toolsDir()
         return juce::File::getCurrentWorkingDirectory().getChildFile (env);
 
    #if JUCE_WINDOWS
-    const auto base = juce::File::getSpecialLocation (juce::File::windowsLocalAppData);
+    return juce::File::getSpecialLocation (juce::File::windowsLocalAppData).getChildFile ("SampleGrabber").getChildFile ("bin");
    #else
-    const auto base = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory);   // like settings.xml
+    return sg::settings::appDataRoot().getChildFile ("bin");   // like settings.xml
    #endif
-    return base.getChildFile ("SampleGrabber").getChildFile ("bin");
 }
 
 juce::String ToolManager::toolName (Tool t)

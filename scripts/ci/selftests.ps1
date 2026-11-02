@@ -2,12 +2,13 @@
 # Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# Runs the app's built-in self tests on Windows (CI). All app folders point into a scratch directory.
-# Usage: selftests.ps1 -App <path to Sample Grabber.exe> -Work <scratch dir>
+# Runs the app's built-in self tests in CI (Windows, macOS). All app folders point into a scratch directory.
+# Usage: selftests.ps1 -App <path to the app executable> -Work <scratch dir> [-Skip name,name]
 # Exit code 0 = all tests passed. Logs and snapshot PNGs end up in <Work>/out.
 param(
     [Parameter(Mandatory)] [string] $App,
-    [Parameter(Mandatory)] [string] $Work
+    [Parameter(Mandatory)] [string] $Work,
+    [string[]] $Skip = @()   # e.g. tools,grab-file,grab-range where the tool installer is not supported yet
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,7 +20,8 @@ $logs = Join-Path $out "logs"
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 
 $wav = Join-Path $Work "loop124.wav"
-python "$PSScriptRoot/make-test-wav.py" $wav 20
+$py = if ($IsWindows) { "python" } else { "python3" }   # python3 on Windows may be the Microsoft Store stub
+& $py "$PSScriptRoot/make-test-wav.py" $wav 20
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $wav)) { throw "could not create the test wav" }
 
 $tools = Join-Path $Work "tools"
@@ -28,6 +30,7 @@ $results = [System.Collections.Generic.List[object]]::new()
 # Runs the app once with the given variables, waits (with timeout), prints stderr, records the result
 function Invoke-SelfTest([string] $Name, [hashtable] $Vars, [int] $TimeoutSec = 120, [scriptblock] $Check = $null)
 {
+    if ($Skip -contains $Name) { Write-Host "skipped: $Name"; return }
     $base = Join-Path $Work $Name
     $all = @{
         SG_CACHE_DIR  = Join-Path $base "cache"
@@ -61,7 +64,7 @@ function Invoke-SelfTest([string] $Name, [hashtable] $Vars, [int] $TimeoutSec = 
 
 Invoke-SelfTest "range"  @{ SG_RANGE_SELFTEST = "1" }
 Invoke-SelfTest "cache"  @{ SG_CACHE_SELFTEST = "1" }
-Invoke-SelfTest "state"  @{ SG_STATE_SELFTEST = $wav; SG_SELFTEST_TMP = (Join-Path $Work "state\tmp") }
+Invoke-SelfTest "state"  @{ SG_STATE_SELFTEST = $wav; SG_SELFTEST_TMP = (Join-Path (Join-Path $Work "state") "tmp") }
 Invoke-SelfTest "export" @{ SG_EXPORT_SELFTEST = $wav }
 
 # Windows process tree: quoting round trip, kill() and destroying a running process leave nothing behind
