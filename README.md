@@ -153,6 +153,17 @@ The external tools are never bundled with Sample Grabber. They are downloaded by
 
 Sample Grabber is a tool. You are responsible for having the rights to the audio you download, sample and release, and for following each platform's terms of service.
 
+## Support
+
+Sample Grabber is free and stays free. If it saves you time, you can buy us a coffee - it helps keep the project maintained.
+
+<a href="https://ko-fi.com/mythenstudios">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/kofi-dark.svg">
+    <img alt="Support on Ko-fi" src=".github/assets/kofi-light.svg" height="40">
+  </picture>
+</a>
+
 ## License
 
 Sample Grabber is free software, licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-or-later).
