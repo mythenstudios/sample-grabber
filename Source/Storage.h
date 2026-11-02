@@ -71,6 +71,8 @@ namespace sg::storage
 
     // Video ids from yt-dlp probes (any thread). Only ids matching [A-Za-z0-9_-]{6,} are used for file matching.
     bool isValidVideoId (const juce::String&);
+    // "<title>_<11-char YouTube id>" (the id itself may contain '_')
+    bool hasVideoIdTail (const juce::String& name);
     void rememberVideoId (const juce::String& url, const juce::String& id);   // per process, small (oldest dropped)
     juce::String videoIdFor (const juce::String& url);
     // Whole-audio downloads in flight, per video id, process-wide: a second job for the same id waits, then reuses the file

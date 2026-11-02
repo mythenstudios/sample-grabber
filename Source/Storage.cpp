@@ -279,9 +279,9 @@ namespace sg::storage
         // yt-dlp appends "_<11-char id>" - only for our own downloads (a local "My_Song_Final_Mix12" keeps its name)
         const auto parent = f.getParentDirectory();
         const bool fromDownloads = parent == cacheRoot().getChildFile ("downloads") || parent == appDataDir().getChildFile ("downloads");
-        const int us = n.lastIndexOfChar ('_');
-        if (fromDownloads && us > 0 && n.length() - us - 1 == 11)
-            n = n.substring (0, us);
+        // By position, not by the last '_': YouTube IDs may contain '_' themselves ("fJrJ2_ZsydE")
+        if (fromDownloads && hasVideoIdTail (n))
+            n = n.substring (0, n.length() - 12);
 
         return sanitizeTitle (n);
     }
@@ -394,6 +394,12 @@ namespace sg::storage
     bool isValidVideoId (const juce::String& id)
     {
         return id.length() >= 6 && id.containsOnly ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-");
+    }
+
+    bool hasVideoIdTail (const juce::String& name)
+    {
+        const int n = name.length();
+        return n > 12 && name[n - 12] == '_' && isValidVideoId (name.substring (n - 11));
     }
 
     void rememberVideoId (const juce::String& url, const juce::String& id)

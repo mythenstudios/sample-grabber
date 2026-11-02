@@ -23,9 +23,8 @@ namespace
     {
         sg::range::Range r;
         auto n = sg::storage::stripRangeTag (f, &r);
-        const int us = n.lastIndexOfChar ('_');
-        if (us > 0 && n.length() - us - 1 == 11)
-            n = n.substring (0, us);
+        if (sg::storage::hasVideoIdTail (n))
+            n = n.substring (0, n.length() - 12);
         auto out = n.replaceCharacter ('_', ' ').toUpperCase();
         if (r.set)
             out << " (" << sg::range::formatTime (r.from) << "-"
