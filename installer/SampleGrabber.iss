@@ -73,7 +73,7 @@ Name: "vst3"; Description: "VST3 plugin (FL Studio, Ableton Live, Bitwig, Reaper
 Name: "app";  Description: "Standalone app";                                             Types: full custom
 
 [Tasks]
-Name: "startmenu";   Description: "Start menu entry";  Components: app
+Name: "startmenu";   Description: "Start menu entry (find the app via Windows search)";  Components: app
 Name: "desktopicon"; Description: "Desktop shortcut";  Components: app; Flags: unchecked
 
 [Files]
@@ -197,9 +197,9 @@ function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := False;
   if not IsAdvanced() then
-    Result := (PageID = wpSelectDir) or (PageID = wpSelectComponents) or (PageID = wpSelectTasks)
-              or (PageID = FolderPage.ID);
-  // Folder page: the VST3 line only matters with the plugin selected, but the page is still needed for exports/cache
+    // The tasks page (Start menu / desktop) stays in both modes: Inno builds the component-dependent task list
+    // only when that page is shown, a skipped page left both shortcuts unselected
+    Result := (PageID = wpSelectDir) or (PageID = wpSelectComponents) or (PageID = FolderPage.ID);
 end;
 
 function IsInside(const Child, Parent: String): Boolean;
