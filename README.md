@@ -11,7 +11,20 @@
 </p>
 
 <p align="center">
-  <sub>VST3 &middot; Standalone &nbsp;&mdash;&nbsp; C++ / JUCE 8 &nbsp;&mdash;&nbsp; by Mythen Studios</sub>
+  <sub>by Mythen Studios</sub>
+</p>
+
+<p align="center">
+  <a href="https://isocpp.org"><img src="https://img.shields.io/badge/C%2B%2B17-18181A?style=for-the-badge&logo=cplusplus&logoColor=white" alt="C++17"></a>
+  <a href="https://juce.com"><img src="https://img.shields.io/badge/JUCE%208-18181A?style=for-the-badge&logo=juce&logoColor=white" alt="JUCE 8"></a>
+  <a href="#install-windows"><img src="https://img.shields.io/badge/VST3-18181A?style=for-the-badge&logo=steinberg&logoColor=white" alt="VST3"></a>
+  <a href="#install-windows"><img src="https://img.shields.io/badge/Standalone-18181A?style=for-the-badge" alt="Standalone"></a>
+  <a href="#status"><img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-18181A?style=for-the-badge&labelColor=2A2A2C&logo=linux&logoColor=white" alt="Platform: Windows | Linux"></a>
+</p>
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL%20v3-FF3B21?style=for-the-badge&labelColor=2A2A2C" alt="License: AGPL v3"></a>
+  <a href="https://github.com/mythenstudios/sample-grabber/stargazers"><img src="https://img.shields.io/github/stars/mythenstudios/sample-grabber?style=for-the-badge&color=18181A&labelColor=2A2A2C&logo=github&logoColor=white" alt="GitHub stars"></a>
+  <a href="https://ko-fi.com/mythenstudios"><img src="https://img.shields.io/badge/Ko--fi-Support-18181A?style=for-the-badge&labelColor=2A2A2C&logo=kofi&logoColor=FF3B21" alt="Support on Ko-fi"></a>
 </p>
 
 <p align="center">
