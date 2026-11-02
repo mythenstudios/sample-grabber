@@ -26,6 +26,11 @@
   <a href="https://github.com/mythenstudios/sample-grabber/stargazers"><img src="https://img.shields.io/github/stars/mythenstudios/sample-grabber?style=for-the-badge&color=18181A&labelColor=2A2A2C&logo=github&logoColor=white" alt="GitHub stars"></a>
   <a href="https://ko-fi.com/mythenstudios"><img src="https://img.shields.io/badge/Ko--fi-Support-18181A?style=for-the-badge&labelColor=2A2A2C&logo=kofi&logoColor=FF3B21" alt="Support on Ko-fi"></a>
 </p>
+<p align="center">
+  <a href="https://mythenstudios.com/"><img src="https://img.shields.io/badge/mythenstudios.com-18181A?style=for-the-badge" alt="mythenstudios.com"></a>
+  <a href="https://www.instagram.com/mythenstudios"><img src="https://img.shields.io/badge/Instagram-18181A?style=for-the-badge&logo=instagram&logoColor=white" alt="Instagram"></a>
+  <a href="https://www.youtube.com/@mythen-studios"><img src="https://img.shields.io/badge/YouTube-18181A?style=for-the-badge&logo=youtube&logoColor=white" alt="YouTube"></a>
+</p>
 
 <p align="center">
   <img src="docs/media/demo.gif" width="760" alt="Sample Grabber: pads, fades and settings">
