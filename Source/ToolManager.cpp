@@ -457,6 +457,79 @@ void ToolManager::releaseExternalGate()
 bool ToolManager::installMissing()                 { return startJob (Job::installMissing, true); }
 bool ToolManager::updateAll (bool force)           { return startJob (force ? Job::updateForce : Job::update, true); }
 bool ToolManager::checkForUpdates()                { return startJob (Job::check, true); }
+bool ToolManager::removeOwnTools()                 { return startJob (Job::remove, true); }
+
+juce::Array<juce::File> ToolManager::ownFiles()
+{
+    const auto dir = toolsDir();
+    juce::Array<juce::File> out;
+    for (const auto& n : { exeName ("yt-dlp"), exeName ("deno"), exeName ("ffmpeg"), exeName ("ffprobe"),
+                           juce::String ("tools.xml"), juce::String ("tools.xml.bad"), juce::String (".tmp") })
+    {
+        const auto f = dir.getChildFile (n);
+        if (f.exists() || f.isSymbolicLink())
+            out.add (f);
+    }
+    // Backups from a Windows replace ("<name>.old-<ms>") - only those of our own programs
+    if (dir.isDirectory())
+        for (const auto& f : dir.findChildFiles (juce::File::findFiles, false, "*.old-*", juce::File::FollowSymlinks::no))
+            for (const auto& base : { "yt-dlp", "deno", "ffmpeg", "ffprobe" })
+                if (f.getFileName().startsWith (exeName (base) + ".old-"))
+                    out.add (f);
+    return out;
+}
+
+bool ToolManager::hasOwnFiles() const
+{
+    return ! ownFiles().isEmpty();
+}
+
+// Worker thread, inside the InterProcessLock (no install of another process runs)
+void ToolManager::doRemove (juce::String& note, bool& isError)
+{
+    {
+        // Same gate as replacing a tool: no grab of this process may start or run meanwhile
+        const juce::ScopedLock sl (gateLock);
+        if (externalJobs > 0)
+        {
+            note = "TOOLS NOT REMOVED - A DOWNLOAD IS RUNNING";
+            isError = true;
+            return;
+        }
+        replacing = true;
+    }
+
+    setStatus ("REMOVING TOOLS", -1.0f);
+    juce::StringArray failed;
+    int removed = 0;
+    for (const auto& f : ownFiles())
+    {
+        // A symlink is removed itself, never followed; .tmp only holds our own staging folders
+        const bool ok = f.isDirectory() && ! f.isSymbolicLink() ? f.deleteRecursively (false) : f.deleteFile();
+        if (ok)
+            ++removed;
+        else
+            failed.add (f.getFileName());
+        std::cerr << "[SG-TOOLS] remove " << f.getFullPathName().toStdString() << (ok ? "" : " FAILED") << std::endl;
+    }
+    // The folder itself only if it is empty now (other files in it stay untouched)
+    const auto dir = toolsDir();
+    if (dir.isDirectory() && dir.getNumberOfChildFiles (juce::File::findFilesAndDirectories) == 0)
+        dir.deleteFile();
+
+    releaseExternalGate();
+
+    for (int i = 0; i < numTools; ++i)
+        setToolState ((Tool) i, State::missing, {});   // forget old errors/messages
+
+    if (failed.isEmpty())
+        note = removed > 0 ? "TOOLS REMOVED - INSTALL TOOLS GETS THEM AGAIN" : "NO TOOLS TO REMOVE";
+    else
+    {
+        note = "COULD NOT REMOVE " + failed.joinIntoString (", ").toUpperCase() + " - IN USE? CLOSE OTHER SAMPLE GRABBERS";
+        isError = true;
+    }
+}
 
 void ToolManager::requestAutoCheck()
 {
@@ -613,6 +686,10 @@ void ToolManager::run()
         {
             doCheck (note, isError);
         }
+        else if (job == Job::remove)
+        {
+            doRemove (note, isError);
+        }
         else if (job == Job::autoCheck)
         {
             doCheck (note, isError);
@@ -645,8 +722,9 @@ void ToolManager::run()
         // Clean up leftovers (aborted downloads) - only with the lock, otherwise it could be another process's folder
         toolsDir().getChildFile (".tmp").deleteRecursively();
         // Old programs from the Windows replace (were still running) - errors do not matter, next run tries again
-        for (auto& f : toolsDir().findChildFiles (juce::File::findFiles, false, "*.old-*"))
-            f.deleteFile();
+        for (auto& f : ownFiles())
+            if (f.getFileName().contains (".old-"))
+                f.deleteFile();   // only backups of our own programs, never other files in the folder
         ipl.exit();
     }
 
@@ -1431,6 +1509,51 @@ int ToolManager::runSelfTest (const juce::String& mode)
              + "  (" + juce::String ((juce::Time::getMillisecondCounter() - t0) / 1000.0, 1) + " s)");
         return ! tm->lastNoteIsError();
     };
+
+    // SG_TOOLS_SELFTEST=remove (needs SG_TOOLS_DIR, no network): fake tools + a foreign file, REMOVE TOOLS must
+    // delete exactly ours
+    if (mode == "remove")
+    {
+        if (pathFallbackAllowed())
+        {
+            say ("remove: set SG_TOOLS_DIR to a scratch folder first");
+            return 2;
+        }
+        const auto dir = toolsDir();
+        dir.createDirectory();
+        const juce::StringArray ours { exeName ("yt-dlp"), exeName ("deno"), exeName ("ffmpeg"), exeName ("ffprobe"),
+                                       "tools.xml", exeName ("yt-dlp") + ".old-123" };
+        for (const auto& n : ours)
+            dir.getChildFile (n).replaceWithText (n == "tools.xml" ? "<TOOLS/>" : "fake");
+        dir.getChildFile (".tmp").getChildFile ("ffmpeg-1").getChildFile ("x.zip").create();
+        const auto foreign = dir.getChildFile ("my-notes.txt");
+        const auto foreignOld = dir.getChildFile ("other.old-5");
+        foreign.replaceWithText ("not ours");
+        foreignOld.replaceWithText ("not ours");
+
+        tm->refresh();
+        bool ok = tm->hasOwnFiles() && tm->getInfo (Tool::ytdlp).own;
+        // A grab in flight blocks the removal
+        tm->tryBeginExternalJob();
+        ok = ! runAndWait ("removeOwnTools (grab running)", [&] { return tm->removeOwnTools(); }) && ok;
+        ok = ok && dir.getChildFile (exeName ("yt-dlp")).existsAsFile();
+        tm->endExternalJob();
+
+        ok = runAndWait ("removeOwnTools", [&] { return tm->removeOwnTools(); }) && ok;
+        for (const auto& n : ours)
+            if (dir.getChildFile (n).exists())
+            {
+                say ("FAIL: still there: " + n);
+                ok = false;
+            }
+        if (dir.getChildFile (".tmp").exists())   { say ("FAIL: .tmp still there"); ok = false; }
+        if (! foreign.existsAsFile() || ! foreignOld.existsAsFile())   { say ("FAIL: foreign file deleted"); ok = false; }
+        if (tm->hasOwnFiles() || tm->getInfo (Tool::ytdlp).own || ! tm->needsInstall())   { say ("FAIL: state not refreshed"); ok = false; }
+        foreign.deleteFile();
+        foreignOld.deleteFile();
+        say (ok ? "RESULT: OK" : "RESULT: FAILED");
+        return ok ? 0 : 1;
+    }
 
     bool ok = true;
     if (mode == "force")

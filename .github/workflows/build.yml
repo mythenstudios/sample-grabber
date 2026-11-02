@@ -46,8 +46,36 @@ jobs:
           path: ${{ env.PKG }}
           retention-days: 7
 
+      # Inno Setup is preinstalled on windows-2022 (6.7.x); the dark wizard needs 6.6+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "Inno Setup not found at $iscc" }
+          $isv = [version]((Get-Item $iscc).VersionInfo.ProductVersion -replace '[^0-9.].*$', '')
+          "Inno Setup $isv"
+          if ($isv -lt [version]"6.7.0") { throw "Inno Setup $isv too old (WizardBackColor needs 6.7, dark wizard 6.6)" }
+          $ver = (Select-String -Path CMakeLists.txt -Pattern 'project\(SampleGrabber VERSION ([0-9.]+)\)').Matches[0].Groups[1].Value
+          $pkg = (Resolve-Path $env:PKG).Path
+          & $iscc "/DAppVersion=$ver" "/DPkgDir=$pkg" "/O$PWD\dist\setup" installer\SampleGrabber.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          $setup = Get-ChildItem dist\setup\*.exe | Select-Object -First 1
+          "SETUP=$($setup.FullName)" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sample-grabber-windows-x64-setup
+          path: ${{ env.SETUP }}
+          retention-days: 7
+
+      # Silent per-user install + uninstall: files land where the summary says, the uninstaller cleans up
+      - name: Installer self test
+        shell: pwsh
+        run: ./scripts/ci/installer-test.ps1 -Setup "$env:SETUP"
+
       # After the upload on purpose: a failing self test still leaves the package to download
       - name: Self tests
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: ./scripts/ci/selftests.ps1 -App "build/SampleGrabberApp_artefacts/Release/Sample Grabber.exe" -Work "${{ runner.temp }}/sg-selftest"
 

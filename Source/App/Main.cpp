@@ -5,6 +5,7 @@
 #include "Downloader.h"
 #include "TimeRange.h"
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <thread>
@@ -239,9 +240,10 @@ namespace selftest
 
         juce::MemoryBlock st;
         int selLen = 0;
+        const auto shownTitle = juce::String::fromUTF8 ("Selftest - Ausl\xc3\xa4nder");   // non-ASCII display title round trip
         {
             SampleGrabberProcessor a;
-            expect (a.loadSample (copy, true, "https://example.com/watch?v=selftest"), "load source");
+            expect (a.loadSample (copy, true, "https://example.com/watch?v=selftest", {}, shownTitle), "load source");
             a.setTrim (0.25f, 0.5f);
             a.setSliceMode (SampleGrabberProcessor::SliceMode::beat);
             a.analyse();
@@ -268,6 +270,7 @@ namespace selftest
             printState ("B source present", b);
             expect (b.getLoadedFile() == copy && std::abs (b.getTrimStart() - 0.25f) < 1.0e-4f, "B loads source + trim");
             expect (b.getRestoreNote().isEmpty(), "B no note");
+            expect (b.getDisplayTitle() == shownTitle, "B display title");
             expect (b.getEmbeddedAudioBytes() > 0, "B seeded FLAC from state");
         }
 
@@ -283,6 +286,7 @@ namespace selftest
             expect (c.getTrimStart() < 1.0e-6f && c.getTrimEnd() > 1.0f - 1.0e-6f, "C trim = whole");
             expect (c.getRestoreNote() == "SOURCE MISSING - USING SAVED SELECTION", "C note");
             expect (c.getSourceUrl() == "https://example.com/watch?v=selftest", "C url kept");
+            expect (c.getDisplayTitle() == shownTitle, "C display title");
             expect (c.getSliceMode() == SampleGrabberProcessor::SliceMode::beat, "C slice mode");
             // Narrow the selection inside the embedded audio, save again: trims must come out in original coordinates
             c.setTrim (0.5f, 1.0f);
@@ -425,6 +429,96 @@ namespace selftest
 
         std::fprintf (stderr, "[SG-STATE] %s\n", failures == 0 ? "ALL OK" : "FAILURES");
         return failures == 0 ? 0 : 1;
+    }
+
+    // Part of SG_SETTINGS_SELFTEST (not Windows: the registry is left alone there): folder priority env > stored > default
+    // for the export folder, plus checkChosenFolder. Writes settings.xml (exportDir) and restores the old value; test
+    // folders go to the temp folder (TMPDIR). Exit code 0 = ok.
+    static int runFolders()
+    {
+       #if JUCE_WINDOWS
+        std::fprintf (stderr, "[SG-SETTINGS] folders: skipped on Windows (registry)\n");
+        return 0;
+       #else
+        using sg::storage::Folder;
+        int failures = 0;
+        auto expect = [&] (bool ok, const char* what)
+        {
+            std::fprintf (stderr, "[SG-SETTINGS] folders: %s %s\n", ok ? "ok  " : "FAIL", what);
+            if (! ok)
+                ++failures;
+        };
+
+        const auto oldStored = sg::storage::storedFolder (Folder::exports);
+        const auto oldEnv = juce::SystemStats::getEnvironmentVariable ("SG_EXPORT_DIR", {});
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("sg-folders-" + juce::String (juce::Time::currentTimeMillis()));
+        const auto stored = scratch.getChildFile ("stored exports");
+        const auto envDir = scratch.getChildFile ("env exports");
+
+        ::unsetenv ("SG_EXPORT_DIR");
+        expect (sg::storage::setStoredFolder (Folder::exports, {}), "reset stored value");
+        expect (sg::storage::exportRoot() == sg::storage::defaultFolder (Folder::exports), "nothing set -> default");
+        expect (sg::storage::setStoredFolder (Folder::exports, stored.getFullPathName()), "store a folder");
+        expect (sg::storage::storedFolder (Folder::exports) == stored.getFullPathName(), "stored value reads back");
+        expect (sg::storage::exportRoot() == stored && stored.isDirectory(), "stored -> used (and created)");
+        ::setenv ("SG_EXPORT_DIR", envDir.getFullPathName().toRawUTF8(), 1);
+        expect (sg::storage::folderFromEnv (Folder::exports) && sg::storage::exportRoot() == envDir, "env wins over stored");
+        ::unsetenv ("SG_EXPORT_DIR");
+        sg::settings::set ("exportDir", "relative/path");
+        expect (sg::storage::exportRoot() == sg::storage::defaultFolder (Folder::exports), "relative stored -> default");
+        sg::settings::set ("exportDir", "   ");
+        expect (sg::storage::exportRoot() == sg::storage::defaultFolder (Folder::exports), "blank stored -> default");
+        sg::settings::set ("exportDir", "/proc/sg-cannot-create/x");
+        expect (sg::storage::exportRoot() == sg::storage::defaultFolder (Folder::exports), "uncreatable stored -> default");
+
+        juce::File chosen;
+        expect (sg::storage::checkChosenFolder (Folder::exports, "rel/dir", chosen).failed(), "check: relative refused");
+        expect (sg::storage::checkChosenFolder (Folder::exports, "/", chosen).failed(), "check: root refused");
+        expect (sg::storage::checkChosenFolder (Folder::cache, juce::File::getSpecialLocation (juce::File::userHomeDirectory)
+                                                   .getFullPathName(), chosen).failed(), "check: home refused as cache");
+        expect (sg::storage::checkChosenFolder (Folder::exports, sg::storage::cacheRoot().getChildFile ("x").getFullPathName(),
+                                                chosen).failed(), "check: exports inside the cache refused");
+        const auto foreign = scratch.getChildFile ("foreign");
+        foreign.getChildFile ("song.wav").create();
+        expect (sg::storage::checkChosenFolder (Folder::cache, "\"" + foreign.getFullPathName() + "\"", chosen).wasOk()
+                    && chosen == foreign.getChildFile ("Sample Grabber Cache") && chosen.isDirectory(),
+                "check: foreign folder as cache -> own subfolder");
+        const auto onlyDl = scratch.getChildFile ("only downloads");
+        onlyDl.getChildFile ("downloads").getChildFile ("myfile").create();
+        expect (sg::storage::checkChosenFolder (Folder::cache, onlyDl.getFullPathName(), chosen).wasOk()
+                    && chosen == onlyDl.getChildFile ("Sample Grabber Cache"),
+                "check: folder with only downloads/myfile as cache -> own subfolder");
+        const auto fresh = scratch.getChildFile ("new cache");
+        expect (sg::storage::checkChosenFolder (Folder::cache, fresh.getFullPathName(), chosen).wasOk() && chosen == fresh
+                    && fresh.isDirectory(), "check: new folder as cache -> used as is");
+
+        // Stored cache folder (installer writes it unchecked): same rules as CHANGE
+        {
+            const auto oldCacheStored = sg::storage::storedFolder (Folder::cache);
+            const auto oldCacheEnv = juce::SystemStats::getEnvironmentVariable ("SG_CACHE_DIR", {});
+            ::unsetenv ("SG_CACHE_DIR");
+            sg::settings::set ("cacheDir", juce::File::getSpecialLocation (juce::File::userHomeDirectory).getFullPathName());
+            expect (sg::storage::resolveFolder (Folder::cache) == sg::storage::defaultFolder (Folder::cache), "stored cache = home -> default");
+            sg::settings::set ("cacheDir", onlyDl.getFullPathName());
+            expect (sg::storage::resolveFolder (Folder::cache) == onlyDl.getChildFile ("Sample Grabber Cache")
+                        && ! sg::storage::hasCacheMarker (onlyDl), "stored cache = foreign folder -> own subfolder");
+            const auto storedFresh = scratch.getChildFile ("stored new cache");
+            sg::settings::set ("cacheDir", storedFresh.getFullPathName());
+            expect (sg::storage::resolveFolder (Folder::cache) == storedFresh, "stored cache = new folder -> used as is");
+            sg::storage::setStoredFolder (Folder::cache, oldCacheStored);
+            if (oldCacheEnv.isNotEmpty())
+                ::setenv ("SG_CACHE_DIR", oldCacheEnv.toRawUTF8(), 1);
+        }
+
+        // Restore
+        sg::storage::setStoredFolder (Folder::exports, oldStored);
+        if (oldEnv.isNotEmpty())
+            ::setenv ("SG_EXPORT_DIR", oldEnv.toRawUTF8(), 1);
+        scratch.deleteRecursively();
+        std::fprintf (stderr, "[SG-SETTINGS] folders: %s\n", failures == 0 ? "ALL OK" : "FAILURES");
+        return failures == 0 ? 0 : 1;
+       #endif
     }
 
     // SG_EXPORT_SELFTEST=<wav>: staging + drag fallback + reuse, files go to SG_EXPORT_DIR
@@ -944,7 +1038,7 @@ public:
 
     void initialise (const juce::String&) override
     {
-        // Self-test of the tool installation without a window: SG_TOOLS_SELFTEST=1|update|force [SG_TOOLS_DIR=<folder>]
+        // Self-test of the tool installation without a window: SG_TOOLS_SELFTEST=1|update|force|remove [SG_TOOLS_DIR=<folder>]
         // (test helpers: SG_TOOLS_ONLY=yt-dlp,deno,ffmpeg, SG_TOOLS_FAKE_BAD_SHA=1|<tool>, SG_TOOLS_HTTP=juce). Exit code 0 = ok.
         // SG_SETTINGS_SELFTEST=1: read settings.xml and write one value back unchanged (tests .bad handling)
         if (juce::SystemStats::getEnvironmentVariable ("SG_SETTINGS_SELFTEST", {}).isNotEmpty())
@@ -955,6 +1049,7 @@ public:
                       << " autoUpdateYtDlp=" << (autoYt ? "on" : "off") << std::endl;
             ToolManager::setAutoUpdateYtDlp (autoYt);
             std::cerr << "[SG-SETTINGS] written, theme now=" << sg::settings::get ("theme", "(default)").toStdString() << std::endl;
+            setApplicationReturnValue (selftest::runFolders());
             quit();
             return;
         }

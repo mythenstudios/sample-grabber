@@ -1,4 +1,5 @@
 #include "Storage.h"
+#include "ToolManager.h"
 #include "UserSettings.h"
 #include <algorithm>
 #include <cmath>
@@ -57,6 +58,28 @@ namespace
     {
         std::fprintf (stderr, "[SG] %s\n", s.toRawUTF8());
     }
+
+    const char* folderEnvName (sg::storage::Folder f)  { return f == sg::storage::Folder::cache ? "SG_CACHE_DIR" : "SG_EXPORT_DIR"; }
+    const char* folderKey (sg::storage::Folder f)      { return f == sg::storage::Folder::cache ? "cacheDir" : "exportDir"; }
+
+   #if JUCE_WINDOWS
+    // Same key and value names as installer/SampleGrabber.iss
+    juce::String folderRegPath (sg::storage::Folder f)
+    {
+        return juce::String ("HKEY_CURRENT_USER\\Software\\Mythen Studios\\Sample Grabber\\")
+               + (f == sg::storage::Folder::cache ? "CacheDir" : "ExportDir");
+    }
+   #endif
+
+    // Missing or completely empty folder. Only such a folder (or one with our marker) may become a cache: a folder with
+    // just "downloads/" in it can be anybody's.
+    bool isEmptyOrMissing (const juce::File& dir)
+    {
+        return ! dir.exists() || (dir.isDirectory() && dir.getNumberOfChildFiles (juce::File::findFilesAndDirectories) == 0);
+    }
+
+    // The only folders below the cache root that cleaning touches
+    constexpr const char* cacheSubfolders[] = { "downloads", "imports", "staging", "tmp" };
 }
 
 namespace sg::storage
@@ -67,23 +90,193 @@ namespace sg::storage
         return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory).getChildFile ("SampleGrabber");
     }
 
-    juce::File cacheRoot()
+    juce::File defaultFolder (Folder f)
     {
-        const auto env = envDir ("SG_CACHE_DIR");
+        if (f == Folder::exports)
+            return juce::File::getSpecialLocation (juce::File::userMusicDirectory).getChildFile ("Sample Grabber");
        #if JUCE_WINDOWS
         // Large downloads must not roam: Local AppData (settings.xml/audio.xml stay in Roaming via appDataDir())
-        const auto defaultRoot = juce::File::getSpecialLocation (juce::File::windowsLocalAppData).getChildFile ("SampleGrabber").getChildFile ("cache");
+        return juce::File::getSpecialLocation (juce::File::windowsLocalAppData).getChildFile ("SampleGrabber").getChildFile ("cache");
        #else
-        const auto defaultRoot = appDataDir().getChildFile ("cache");
+        return appDataDir().getChildFile ("cache");
        #endif
-        return env != juce::File() ? env : defaultRoot;
+    }
+
+    juce::String storedFolder (Folder f)
+    {
+       #if JUCE_WINDOWS
+        return juce::WindowsRegistry::getValue (folderRegPath (f), {}).trim();
+       #else
+        return sg::settings::get (folderKey (f), {}).trim();
+       #endif
+    }
+
+    bool setStoredFolder (Folder f, const juce::String& absPath)
+    {
+        const auto v = absPath.trim();
+       #if JUCE_WINDOWS
+        if (v.isEmpty())
+            return ! juce::WindowsRegistry::valueExists (folderRegPath (f)) || juce::WindowsRegistry::deleteValue (folderRegPath (f));
+        return juce::WindowsRegistry::setValue (folderRegPath (f), v);
+       #else
+        if (v.isEmpty())
+            return sg::settings::remove (folderKey (f));
+        return sg::settings::set (folderKey (f), v);
+       #endif
+    }
+
+    bool folderFromEnv (Folder f)
+    {
+        return envDir (folderEnvName (f)) != juce::File();
+    }
+
+    juce::File resolveFolder (Folder f)
+    {
+        const auto env = envDir (folderEnvName (f));
+        if (env != juce::File())
+            return env;
+
+        const auto stored = storedFolder (f);
+        if (stored.isNotEmpty())
+        {
+            if (! juce::File::isAbsolutePath (stored))
+            {
+                logLine (juce::String ("folder setting ignored (not an absolute path): ") + folderKey (f) + "=" + stored);
+                return defaultFolder (f);
+            }
+            juce::File dir (stored);
+            // Same rules as CHANGE (the installer writes CacheDir unchecked): unsafe -> default, foreign content -> subfolder.
+            // The default location stored explicitly stays the default (adopted with old content, see ensureCacheRoot).
+            if (f == Folder::cache && dir == defaultFolder (f))
+                return dir;
+            if (f == Folder::cache)
+            {
+                juce::File use;
+                const auto r = cacheFolderFor (dir, use);
+                if (r.failed())
+                {
+                    logLine ("cache folder setting ignored (" + r.getErrorMessage().toLowerCase() + "): " + dir.getFullPathName()
+                             + ", using the default");
+                    return defaultFolder (f);
+                }
+                dir = use;
+            }
+            // A missing drive (USB disk unplugged) or a path that cannot be created: fall back to the default
+            if (dir.isDirectory() || dir.createDirectory().wasOk())
+                return dir;
+            logLine (juce::String ("folder setting ignored (cannot create): ") + dir.getFullPathName() + ", using the default");
+        }
+        return defaultFolder (f);
+    }
+
+    juce::Result checkChosenFolder (Folder f, const juce::String& typed, juce::File& result)
+    {
+        const auto t = typed.trim().unquoted().trim();
+        if (t.isEmpty())
+            return juce::Result::fail ("ENTER A FOLDER PATH");
+        if (! juce::File::isAbsolutePath (t))
+            return juce::Result::fail ("NEEDS A FULL PATH");
+
+        juce::File dir (t);
+        if (dir.getParentDirectory() == dir || dir.getFullPathName().length() <= 3)
+            return juce::Result::fail ("NOT A DRIVE OR FILESYSTEM ROOT");
+        if (dir.existsAsFile())
+            return juce::Result::fail ("THIS IS A FILE, NOT A FOLDER");
+
+        if (f == Folder::cache)
+        {
+            juce::File use;
+            const auto r = cacheFolderFor (dir, use);
+            if (r.failed())
+                return r;
+            dir = use;
+        }
+        else
+        {
+            // Exports inside the cache would be deleted by CLEAR NOW / auto-clean
+            const auto tools = ToolManager::toolsDir();
+            for (const auto& c : { cacheRoot(), resolveFolder (Folder::cache) })
+                if (dir == c || dir.isAChildOf (c))
+                    return juce::Result::fail ("NOT INSIDE THE CACHE FOLDER");
+            if (dir == tools || dir.isAChildOf (tools))
+                return juce::Result::fail ("NOT INSIDE THE TOOLS FOLDER");
+        }
+
+        if (! dir.isDirectory() && dir.createDirectory().failed())
+            return juce::Result::fail ("CANNOT CREATE THIS FOLDER");
+        result = dir;
+        return juce::Result::ok();
+    }
+
+    juce::Result cacheFolderFor (const juce::File& chosen, juce::File& result)
+    {
+        auto dir = chosen;
+        if (dir.existsAsFile())
+            return juce::Result::fail ("THIS IS A FILE, NOT A FOLDER");
+
+        const auto tools = ToolManager::toolsDir();
+        auto checkSafe = [&] (const juce::File& d)
+        {
+            juce::String why;
+            if (! isSafeCacheRoot (d, why) && why != "no marker")
+                return juce::Result::fail ("NOT ALLOWED AS CACHE: " + why.toUpperCase());
+            // The tool installer wipes bin/.tmp, REMOVE TOOLS the bin folder: no cache inside it either
+            if (d.isAChildOf (tools))
+                return juce::Result::fail ("NOT ALLOWED AS CACHE: TOOLS FOLDER");
+            return juce::Result::ok();
+        };
+
+        auto r = checkSafe (dir);
+        if (r.failed())
+            return r;
+        // Foreign files: never mark that folder, use our own subfolder inside it
+        if (! hasCacheMarker (dir) && ! isEmptyOrMissing (dir))
+        {
+            dir = dir.getChildFile ("Sample Grabber Cache");
+            if (dir.existsAsFile())
+                return juce::Result::fail ("THIS IS A FILE, NOT A FOLDER");
+            r = checkSafe (dir);
+            if (r.failed())
+                return r;
+            if (! hasCacheMarker (dir) && ! isEmptyOrMissing (dir))
+                return juce::Result::fail ("SAMPLE GRABBER CACHE SUBFOLDER HAS FOREIGN FILES");
+        }
+        result = dir;
+        return juce::Result::ok();
+    }
+
+    juce::File cacheRoot()
+    {
+        // Once per process: downloads, staging and the cleaner must agree on one folder. A new setting applies after
+        // a restart, the old cache is not moved (CLEAR NOW before changing, or delete it by hand).
+        // The marker is written right here, before staging/downloads can put anything into a new, empty folder
+        // (afterwards it would no longer count as empty).
+        static const juce::File root = []
+        {
+            auto r = resolveFolder (Folder::cache);
+            const bool env = folderFromEnv (Folder::cache);
+            const bool isDefault = ! env && r == defaultFolder (Folder::cache);
+            if (! markCacheRoot (r, isDefault) && ! env && ! isDefault)
+            {
+                // Stored folder changed between the check and here, or not writable: never use it unmarked
+                logLine ("cache: cannot use " + r.getFullPathName() + ", using the default");
+                r = defaultFolder (Folder::cache);
+                markCacheRoot (r, true);
+            }
+            return r;
+        }();
+        return root;
     }
 
     juce::File cacheSubdir (const juce::String& sub)
     {
-        ensureCacheRoot();
         auto d = cacheRoot().getChildFile (sub);
-        d.createDirectory();
+        // SG_CACHE_DIR (tests) is used even without a marker (never cleaned then). Otherwise nothing is created in a
+        // folder that could not be marked: the caller's write fails and reports it.
+        if (ensureCacheRoot() || folderFromEnv (Folder::cache))
+            d.createDirectory();
+        else
+            logLine ("cache: not creating " + d.getFullPathName() + " (cache folder has no " + cacheMarkerName + ")");
         return d;
     }
 
@@ -92,37 +285,33 @@ namespace sg::storage
         return root.getChildFile (cacheMarkerName).existsAsFile();
     }
 
-    bool ensureCacheRoot()
+    bool markCacheRoot (const juce::File& root, bool allowAnyContent)
     {
-        const auto root = cacheRoot();
         if (hasCacheMarker (root))
             return true;
 
-        juce::String why;
-        const bool isDefault = envDir ("SG_CACHE_DIR") == juce::File();
-        bool onlyOurs = true;
-        if (root.isDirectory())
-            for (const auto& c : root.findChildFiles (juce::File::findFilesAndDirectories, false, "*", juce::File::FollowSymlinks::no))
-                if (! (c.isDirectory() && (c.getFileName() == "downloads" || c.getFileName() == "imports" || c.getFileName() == "staging"
-                                       || c.getFileName() == "tmp")))
-                    onlyOurs = false;
-
-        if (! isDefault && ! onlyOurs)
+        if (! allowAnyContent && ! isEmptyOrMissing (root))
         {
-            logLine ("cache: " + root.getFullPathName() + " is not empty and has no " + cacheMarkerName + " - it will never be cleaned");
-            root.createDirectory();
+            logLine ("cache: " + root.getFullPathName() + " is not empty and has no " + cacheMarkerName + " - not marking it, it will never be cleaned");
             return false;
         }
         if (! root.createDirectory())
             return false;
         // Unsafe locations (home, Music, ...) never get a marker either
-        const bool unsafe = ! isSafeCacheRoot (root, why) && why != "no marker";
-        if (unsafe)
+        juce::String why;
+        if (! isSafeCacheRoot (root, why) && why != "no marker")
         {
             logLine ("cache: refusing to mark " + root.getFullPathName() + " (" + why + ")");
             return false;
         }
         return root.getChildFile (cacheMarkerName).replaceWithText ("Sample Grabber cache. Everything in this folder may be deleted by the app.\n");
+    }
+
+    bool ensureCacheRoot()
+    {
+        const auto root = cacheRoot();
+        // Only the built-in default location may be adopted with other content (old installs)
+        return markCacheRoot (root, ! folderFromEnv (Folder::cache) && root == defaultFolder (Folder::cache));
     }
 
     bool isSafeCacheRoot (const juce::File& root, juce::String& whyNot)
@@ -152,6 +341,8 @@ namespace sg::storage
             whyNot = "export folder or its parent";
         else if (home.isAChildOf (root))
             whyNot = "parent of the home folder";
+        else if (same (root, ToolManager::toolsDir()) || ToolManager::toolsDir().isAChildOf (root))
+            whyNot = "tools folder or its parent";
         else if (! hasCacheMarker (root))
             whyNot = "no marker";
         else
@@ -161,10 +352,7 @@ namespace sg::storage
 
     juce::File exportRoot()
     {
-        const auto env = envDir ("SG_EXPORT_DIR");
-        if (env != juce::File())
-            return env;
-        return juce::File::getSpecialLocation (juce::File::userMusicDirectory).getChildFile ("Sample Grabber");
+        return resolveFolder (Folder::exports);
     }
 
     bool isInsideCache (const juce::File& f)
@@ -223,6 +411,19 @@ namespace sg::storage
         if (reserved.contains (stem))
             out = "_" + out;
         return out;
+    }
+
+    juce::String sanitizeDisplayTitle (const juce::String& in)
+    {
+        juce::String out;
+        out.preallocateBytes (in.getNumBytesAsUTF8());
+        for (auto p = in.getCharPointer(); ! p.isEmpty(); ++p)
+        {
+            const juce::juce_wchar ch = *p;
+            if (ch >= 32 && ch != 127)
+                out << juce::String::charToString (ch);
+        }
+        return out.trim().substring (0, 300).trim();
     }
 
     bool isCacheSource (const juce::File& f)
@@ -636,8 +837,18 @@ CacheManager::CleanResult CacheManager::clean (const juce::File& root, sg::stora
     std::vector<Entry> entries;
     juce::int64 total = 0;
 
-    // Only regular files below our own cache root, symlinks are not followed (never delete anything outside)
-    for (const auto& f : root.findChildFiles (juce::File::findFiles, true, "*", juce::File::FollowSymlinks::no))
+    // Only regular files in our own subfolders, symlinks are not followed (never delete anything outside). Files
+    // directly in the root (the marker, anything the user put there) are never touched.
+    std::vector<juce::File> files;
+    for (auto sub : cacheSubfolders)
+    {
+        const auto dir = root.getChildFile (sub);
+        if (dir.isDirectory() && ! dir.isSymbolicLink())
+            for (const auto& f : dir.findChildFiles (juce::File::findFiles, true, "*", juce::File::FollowSymlinks::no))
+                files.push_back (f);
+    }
+
+    for (const auto& f : files)
     {
         if (! f.isAChildOf (root))
             continue;
@@ -794,6 +1005,7 @@ int CacheManager::runSelfTest()
         { "imports/conv_2d.wav",       100,  48.0 },
         { "staging/inst-dead/x.wav",     1,  30.0 },   // staging leftover > 24 h
         { "staging/inst-live/y.wav",     1,   1.0 },
+        { "user_note_10d.txt",           1, 240.0 },   // directly in the root, not ours -> never deleted (not even CLEAR NOW)
     };
 
     auto build = [&]
@@ -853,6 +1065,7 @@ int CacheManager::runSelfTest()
         expect ("downloads/fresh_10s.wav", true);   // auto-clean keeps the 2 min rule
         expect ("staging/inst-dead/x.wav", false);
         expect ("staging/inst-live/y.wav", true);
+        expect ("user_note_10d.txt", true);
         if (mode == AC::off)   { expect ("downloads/old_10d.wav", true); expect ("downloads/old_8d.wav", true); }
         if (mode == AC::days7) { expect ("downloads/old_10d.wav", false); expect ("downloads/old_8d.wav", false); expect ("downloads/mid_3d.wav", true); }
         if (mode == AC::maxSize)
@@ -881,6 +1094,12 @@ int CacheManager::runSelfTest()
     expect ("downloads/fresh_10s.wav", false);
     expect ("downloads/old_10d.wav", false);
     expect ("imports/conv_2d.wav", false);
+    expect ("user_note_10d.txt", true);
+    if (! sg::storage::hasCacheMarker (root))
+    {
+        std::fprintf (stderr, "[SG-CACHE] FAIL: CLEAR NOW removed the marker\n");
+        ++failures;
+    }
     if (cleared.keptInUse != 1 || cleared.keptBusy != 3)
     {
         std::fprintf (stderr, "[SG-CACHE] FAIL: kept counts %d/%d, expected 1 in use / 3 being written\n", cleared.keptInUse, cleared.keptBusy);
@@ -913,6 +1132,41 @@ int CacheManager::runSelfTest()
             if (safe)
                 ++failures;
         }
+    }
+
+    // Foreign folders (outside SG_CACHE_DIR, in the temp folder): only an empty folder may be adopted
+    {
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("sg-cache-foreign-" + juce::String (juce::Time::currentTimeMillis()));
+        auto check = [&] (bool ok, const char* what)
+        {
+            std::fprintf (stderr, "[SG-CACHE] %s %s\n", ok ? "ok  " : "FAIL", what);
+            if (! ok)
+                ++failures;
+        };
+        const auto foreign = scratch.getChildFile ("only-downloads");
+        foreign.getChildFile ("downloads").getChildFile ("myfile").create();
+        check (! sg::storage::markCacheRoot (foreign, false) && ! sg::storage::hasCacheMarker (foreign),
+               "folder with only downloads/myfile is not marked");
+        juce::File use;
+        check (sg::storage::cacheFolderFor (foreign, use).wasOk() && use == foreign.getChildFile ("Sample Grabber Cache"),
+               "folder with only downloads/myfile -> own subfolder");
+        check (foreign.getChildFile ("downloads").getChildFile ("myfile").existsAsFile(), "downloads/myfile untouched");
+
+        const auto empty = scratch.getChildFile ("empty");
+        empty.createDirectory();
+        check (sg::storage::cacheFolderFor (empty, use).wasOk() && use == empty, "empty folder -> used as is");
+        check (sg::storage::markCacheRoot (empty, false) && sg::storage::hasCacheMarker (empty), "empty folder is marked");
+        check (sg::storage::cacheFolderFor (empty, use).wasOk() && use == empty, "marked folder -> used as is");
+
+        const auto both = scratch.getChildFile ("both");
+        both.getChildFile ("song.wav").create();
+        both.getChildFile ("Sample Grabber Cache").getChildFile ("other.wav").create();
+        check (sg::storage::cacheFolderFor (both, use).failed(), "foreign subfolder 'Sample Grabber Cache' refused");
+
+        check (sg::storage::cacheFolderFor (juce::File::getSpecialLocation (juce::File::userHomeDirectory), use).failed(),
+               "home refused");
+        scratch.deleteRecursively();
     }
 
     sg::storage::setInUse (&owner, {});

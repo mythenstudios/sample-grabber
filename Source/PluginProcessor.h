@@ -113,8 +113,9 @@ public:
     // the original path (the URL field accepts paths); empty for a local file loaded directly.
     // sourceRange: normalised range text (sg::range::toText) the file covers, empty = whole source.
     // After a restore with a missing source, loading the same link + range again restores the saved trim if the length fits.
+    // displayTitle: real title of a link (yt-dlp, may contain non-ASCII) for the editor only; empty = name from the file.
     bool loadSample (const juce::File& file, bool recordHistory = true, const juce::String& sourceUrl = {},
-                     const juce::String& sourceRange = {});
+                     const juce::String& sourceRange = {}, const juce::String& displayTitle = {});
 
     // BACK: return to the state before the last load without re-fetching (message thread).
     // The stack lives in RAM only (not in plugin state): at most maxHistoryDepth levels, oldest are dropped first.
@@ -122,6 +123,7 @@ public:
     bool goBack();
     bool hasSample() const;
     juce::File getLoadedFile() const { return loadedFile; }
+    juce::String getDisplayTitle() const;   // title shown in the editor, empty = derive from the file name
     double getFileSampleRate() const { return fileRate.load(); }
     int getFileBitDepth() const { return fileBitDepth.load(); }
     int getNumSamples() const;
@@ -259,6 +261,7 @@ private:
     struct RestoreInfo
     {
         juce::String path, url, range;
+        juce::String displayTitle;                       // empty in older projects
         double sourceSeconds = -1.0;                     // length of the original source, < 0 = unknown (older projects)
         bool sourceKept = true;                          // false = source deleted on purpose (KEEP DOWNLOADS off)
         float trimStart = 0.0f, trimEnd = 1.0f;
@@ -273,9 +276,9 @@ private:
     void applyPendingRestore();   // message thread: applies pendingRestore (newest wins), then clears it
     bool installFromReader (juce::AudioFormatReader& reader, const juce::File& file, bool recordHistory, const juce::String& url,
                             const juce::String& range, bool embedded = false, float embTrimStart = 0.0f, float embTrimEnd = 1.0f,
-                            double sourceSeconds = -1.0);
+                            double sourceSeconds = -1.0, const juce::String& displayTitle = {});
     void setMeta (const juce::File& file, const juce::String& url, const juce::String& range, bool embedded,
-                  float embTrimStart, float embTrimEnd, double sourceSeconds);
+                  float embTrimStart, float embTrimEnd, double sourceSeconds, const juce::String& displayTitle);
     void seedEmbedded (std::shared_ptr<const juce::MemoryBlock> flac);   // restored FLAC = whole current selection
     void updateInUse();   // in-use registry for cache cleaning (loaded file + BACK history), message thread
 
@@ -303,7 +306,7 @@ private:
         std::shared_ptr<juce::AudioBuffer<float>> sample;   // shared pointer, no copy of the buffer
         std::vector<float> flux;
         juce::File file;
-        juce::String url, range;
+        juce::String url, range, displayTitle;
         double sourceSeconds = -1.0;
         bool sourceKept = true;
         bool embedded = false;                              // sample = embedded selection, file is the missing original
@@ -359,7 +362,8 @@ private:
     // Never touched by the audio thread, so a normal lock is fine.
     mutable juce::CriticalSection metaLock;
     juce::String metaPath;          // path written to the state (original file, also when it is missing)
-    juce::String metaTitle;         // export folder/file title
+    juce::String metaTitle;         // export folder/file title (ASCII, from the file name)
+    juce::String metaDisplayTitle;  // real title of a link grab for the editor, empty = use the file name
     juce::String metaUrl;           // link the sample was grabbed from
     juce::String metaRange;         // range text of the source section, empty = whole source
     double metaSourceSeconds = -1.0;   // length of the original source in seconds (< 0 = unknown)
