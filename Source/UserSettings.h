@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #pragma once
 #include <juce_data_structures/juce_data_structures.h>
 #include <iostream>

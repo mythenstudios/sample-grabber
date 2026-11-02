@@ -1,3 +1,7 @@
+# Sample Grabber - https://github.com/mythenstudios/sample-grabber
+# Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Runs the app's built-in self tests on Windows (CI). All app folders point into a scratch directory.
 # Usage: selftests.ps1 -App <path to Sample Grabber.exe> -Work <scratch dir>
 # Exit code 0 = all tests passed. Logs and snapshot PNGs end up in <Work>/out.

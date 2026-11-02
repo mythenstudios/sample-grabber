@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #pragma once
 #include "PluginProcessor.h"
 #include "IconButton.h"
@@ -237,7 +241,7 @@ public:
                     + 16 + 6 + 3 * rowH + 8 + 22 + 6 + 16 + 20   // TOOLS
                     + 16 + 6 + 5 * 22 + 5 * 6 + 16 + 20    // STORAGE (5 rows + note line)
                     + (hasAudio ? 16 + 6 + 22 + 20 : 0)    // AUDIO
-                    + 16 + 16;                             // licence note, bottom margin
+                    + 16 + 4 + 16 + 16;                    // licence note, about line, bottom margin
         panelR = getLocalBounds().withSizeKeepingCentre (w, h);
 
         auto r = panelR.reduced (16);
@@ -327,6 +331,9 @@ public:
         }
 
         footerR = r.removeFromTop (16);
+        r.removeFromTop (4);
+        aboutR = r.removeFromTop (16);
+        sourceR = aboutR.withX (aboutR.getX() + (int) std::ceil (aboutPrefixWidth())).withWidth ((int) std::ceil (sourceWidth()));
     }
 
     void paint (juce::Graphics& g) override
@@ -361,10 +368,47 @@ public:
         g.setFont (ui::label (10.0f));
         g.drawText ("TOOLS FROM OFFICIAL GITHUB RELEASES: YT-DLP (UNLICENSE / GPLV3 BINARY), DENO (MIT), FFMPEG (LGPL)",
                     footerR, juce::Justification::centredLeft);
+
+        // About line: version, copyright, licence, SOURCE link (hit area = only the word SOURCE)
+        g.setFont (ui::label (10.0f));
+        g.drawText (aboutPrefix(), aboutR, juce::Justification::centredLeft, false);
+        g.setColour (sourceHover ? ui::c().red : ui::c().textSecondary);
+        g.drawText ("SOURCE", sourceR, juce::Justification::centredLeft, false);
+        g.fillRect (sourceR.getX(), sourceR.getBottom() - 3, sourceR.getWidth(), 1);   // underline = link
+    }
+
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        const bool over = sourceR.contains (e.getPosition());
+        if (over != sourceHover)
+        {
+            sourceHover = over;
+            repaint (sourceR);
+        }
+    }
+
+    void mouseExit (const juce::MouseEvent&) override
+    {
+        if (sourceHover)
+        {
+            sourceHover = false;
+            repaint (sourceR);
+        }
+    }
+
+    juce::MouseCursor getMouseCursor() override
+    {
+        return sourceR.contains (getMouseXYRelative()) && isVisible() ? juce::MouseCursor::PointingHandCursor
+                                                                       : juce::MouseCursor::NormalCursor;
     }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
+        if (sourceR.contains (e.getPosition()))
+        {
+            juce::URL ("https://github.com/mythenstudios/sample-grabber").launchInDefaultBrowser();
+            return;
+        }
         if (! panelR.contains (e.getPosition()) && onClose)
             onClose();   // click on the scrim closes
     }
@@ -383,6 +427,28 @@ private:
     static constexpr int rowH = 24;
 
     static constexpr int labelW = 84;   // label column of the STORAGE rows
+
+    // Plugin target: JucePlugin_VersionString, standalone target: JUCE_APPLICATION_VERSION_STRING (both from CMake VERSION)
+    static juce::String versionText()
+    {
+       #if defined (JucePlugin_VersionString)
+        return JucePlugin_VersionString;
+       #elif defined (JUCE_APPLICATION_VERSION_STRING)
+        return JUCE_APPLICATION_VERSION_STRING;
+       #else
+        return {};
+       #endif
+    }
+
+    // "SAMPLE GRABBER 0.1.0 · © MYTHEN STUDIOS · AGPL-3.0 · " (middle dot and copyright sign as UTF-8 bytes)
+    static juce::String aboutPrefix()
+    {
+        const auto dot = juce::String::fromUTF8 (" \xc2\xb7 ");
+        return "SAMPLE GRABBER " + versionText() + dot + juce::String::fromUTF8 ("\xc2\xa9") + " MYTHEN STUDIOS" + dot + "AGPL-3.0" + dot;
+    }
+
+    static float aboutPrefixWidth() { return juce::GlyphArrangement::getStringWidth (ui::label (10.0f), aboutPrefix()); }
+    static float sourceWidth()      { return juce::GlyphArrangement::getStringWidth (ui::label (10.0f), "SOURCE"); }
 
     void disarmClear()
     {
@@ -915,7 +981,8 @@ private:
     bool hasAudio = false;
     juce::String localNote;                         // note from the overlay itself (OPEN), until the next tool event
     std::unique_ptr<juce::ChildProcess> opener;     // xdg-open; object stays until the next click (no kill)
-    juce::Rectangle<int> panelR, titleR, appLabelR, toolsLabelR, rowsR, toolStatusR, lastCheckR, audioLabelR, footerR;
+    juce::Rectangle<int> panelR, titleR, appLabelR, toolsLabelR, rowsR, toolStatusR, lastCheckR, audioLabelR, footerR, aboutR, sourceR;
+    bool sourceHover = false;
     juce::Rectangle<int> storageLabelR, cacheR, cacheSizeR, cleanR, cleanNoteR, keepR, keepNoteR, exportR, toolsR, storageHintR, editR;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SettingsOverlay)

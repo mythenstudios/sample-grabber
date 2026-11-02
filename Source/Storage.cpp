@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #include "Storage.h"
 #include "ToolManager.h"
 #include "UserSettings.h"

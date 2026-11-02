@@ -1,3 +1,7 @@
+// Sample Grabber - https://github.com/mythenstudios/sample-grabber
+// Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Windows only (added to the build in CMakeLists.txt under if(WIN32)). windows.h stays in this file: its macros
 // never reach the rest of the code.
 #ifdef _WIN32

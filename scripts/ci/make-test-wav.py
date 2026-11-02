@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Sample Grabber - https://github.com/mythenstudios/sample-grabber
+# Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Synthetic test loop for the CI self tests (no recorded audio in the repo):
 # 124 BPM, kick + hi-hat + a two-chord pad, stereo, 44.1 kHz, 16 bit.
 # Usage: make-test-wav.py <out.wav> [seconds]

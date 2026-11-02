@@ -117,6 +117,14 @@ Sample Grabber is free software, licensed under the [GNU Affero General Public L
 
 Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
 
+**What this means for forks and redistribution:** you may use, study, change and share Sample Grabber.
+If you distribute a modified version, or offer it to users over a network, you must release its complete
+source code under the same license (AGPL-3.0-or-later) and keep the copyright notices. Closed-source,
+paywalled or subscription-only versions of this code are not allowed.
+
+The names "Sample Grabber" and "Mythen Studios" and the logos are not covered by the code license.
+Forks must use their own name and branding, see [TRADEMARKS.md](TRADEMARKS.md).
+
 Third-party components keep their own licenses (see the table above).
 
 <picture>

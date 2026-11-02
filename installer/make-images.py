@@ -1,3 +1,7 @@
+# Sample Grabber - https://github.com/mythenstudios/sample-grabber
+# Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Render the Inno Setup wizard images in the Sample Grabber brand (dark).
 
 Usage: python3 installer/make-images.py   (writes installer/images/*.png)

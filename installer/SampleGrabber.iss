@@ -1,3 +1,7 @@
+; Sample Grabber - https://github.com/mythenstudios/sample-grabber
+; Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+; SPDX-License-Identifier: AGPL-3.0-or-later
+
 ; Sample Grabber - Windows installer (Inno Setup 6.7+, dark wizard needs 6.6+)
 ;
 ; Build (CI does this after packaging):

@@ -1,3 +1,7 @@
+# Sample Grabber - https://github.com/mythenstudios/sample-grabber
+# Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Installer self test (CI, windows-2022): silent per-user install, check files and registry, silent uninstall, check cleanup.
 # Per-user (/CURRENTUSER) so nothing lands in Program Files of the runner and the VST3 goes to the per-user VST3 folder.
 param(
