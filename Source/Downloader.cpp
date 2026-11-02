@@ -18,6 +18,28 @@
 
 namespace
 {
+    // yt-dlp error line for the status line. "ERROR: [youtube] <id>: Sign in to confirm your age..." -> the reason only.
+    // Age-restricted and login-only videos get a clear hint (yt-dlp needs browser cookies for those).
+    juce::String toolErrorText (const juce::String& line)
+    {
+        auto text = line.trim();
+        if (text.startsWithIgnoreCase ("ERROR:"))
+            text = text.substring (6).trim();
+        if (text.startsWithChar ('['))
+        {
+            const int close = text.indexOfChar (']');
+            const int colon = text.indexOfChar (close, ':');
+            if (close > 0 && colon > close)
+                text = text.substring (colon + 1).trim();
+        }
+        const auto low = text.toLowerCase();
+        if (low.contains ("confirm your age") || low.contains ("age-restricted") || low.contains ("inappropriate for some users"))
+            return "VIDEO IS AGE-RESTRICTED - SAVE IT AND DROP THE FILE HERE";
+        if (low.contains ("sign in") || low.contains ("login required") || low.contains ("private video"))
+            return "VIDEO NEEDS A LOGIN - SAVE IT AND DROP THE FILE HERE";
+        return text;
+    }
+
    #if JUCE_LINUX
     std::string readProcFile (const std::string& path)
     {
@@ -452,7 +474,7 @@ void Downloader::runDownload (Result& r)
 
         const float scale = cutLocally ? 0.85f : 0.9f;
         std::string pending;   // raw bytes: a read may end inside a multi-byte UTF-8 character, decode whole lines only
-        juce::String lastLine;
+        juce::String lastLine, errorLine;   // errorLine: the "ERROR:" line, later lines must not hide it
         int lastPct = -1;
         char buf[1024];
 
@@ -489,6 +511,8 @@ void Downloader::runDownload (Result& r)
                 else
                 {
                     lastLine = line;
+                    if (line.startsWithIgnoreCase ("ERROR:"))
+                        errorLine = line;
                     const juce::File f (line);
                     if (f.existsAsFile() && f.getParentDirectory() == outDir)
                     {
@@ -505,7 +529,9 @@ void Downloader::runDownload (Result& r)
         if (exitCode != 0 || ! r.file.existsAsFile())
         {
             r.ok = false;
-            r.message = lastLine.isEmpty() ? juce::String ("Download fehlgeschlagen") : lastLine;
+            r.message = errorLine.isNotEmpty() ? toolErrorText (errorLine)
+                      : lastLine.isNotEmpty()  ? toolErrorText (lastLine)
+                                               : juce::String ("DOWNLOAD FAILED");
             return;
         }
         full = r.file;
@@ -641,7 +667,7 @@ void Downloader::runProbeUrl (Result& r)
     proc->waitForProcessToFinish (5000);
     const auto exitCode = proc->getExitCode();
 
-    juce::String lastLine, json;
+    juce::String lastLine, errorLine, json;   // -J prints "null" on stdout after a failed extraction: keep the ERROR line
     for (const auto& raw : juce::StringArray::fromLines (output))
     {
         const auto line = raw.trim();
@@ -649,7 +675,9 @@ void Downloader::runProbeUrl (Result& r)
             continue;
         if (line.startsWithChar ('{'))
             json = line;   // stderr lines (warnings/errors) are mixed in; the JSON is the line that starts with '{'
-        else
+        else if (line.startsWithIgnoreCase ("ERROR:"))
+            errorLine = line;
+        else if (line != "null")
             lastLine = line;
     }
 
@@ -692,7 +720,9 @@ void Downloader::runProbeUrl (Result& r)
     }
 
     if (! r.ok)
-        r.message = lastLine.isEmpty() ? juce::String ("LINK CHECK FAILED") : lastLine;
+        r.message = errorLine.isNotEmpty() ? toolErrorText (errorLine)
+                  : lastLine.isNotEmpty()  ? toolErrorText (lastLine)
+                                           : juce::String ("LINK CHECK FAILED");
 }
 
 void Downloader::dropInfoJson()
