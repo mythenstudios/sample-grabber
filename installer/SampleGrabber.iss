@@ -64,6 +64,17 @@ WizardSmallImageFile=images\small-100.png,images\small-125.png,images\small-150.
 ; English only, like the app
 Name: "en"; MessagesFile: "compiler:Default.isl"
 
+; Install mode dialog: neutral texts instead of Inno's "(recommended)", with the consequence for the DAW spelled out
+[Messages]
+PrivilegesRequiredOverrideTitle=Install for all users or only for you
+PrivilegesRequiredOverrideInstruction=Who should get Sample Grabber?
+PrivilegesRequiredOverrideText1=All users: the plugin goes to the standard VST3 folder that every DAW scans. Windows asks for admin rights.
+PrivilegesRequiredOverrideText2=Only you: no admin rights needed. The plugin goes to your own VST3 folder - you may have to add that folder in your DAW (FL Studio, Ableton, ...) before it finds the plugin.
+PrivilegesRequiredOverrideAllUsers=Install for &all users
+PrivilegesRequiredOverrideAllUsersRecommended=Install for &all users
+PrivilegesRequiredOverrideCurrentUser=Install for &me only
+PrivilegesRequiredOverrideCurrentUserRecommended=Install for &me only
+
 [Types]
 Name: "full";   Description: "Plugin and app"
 Name: "custom"; Description: "Custom"; Flags: iscustom
