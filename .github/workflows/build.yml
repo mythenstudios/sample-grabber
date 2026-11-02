@@ -52,9 +52,14 @@ jobs:
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "Inno Setup not found at $iscc" }
-          $isv = [version]((Get-Item $iscc).VersionInfo.ProductVersion -replace '[^0-9.].*$', '')
-          "Inno Setup $isv"
-          if ($isv -lt [version]"6.7.0") { throw "Inno Setup $isv too old (WizardBackColor needs 6.7, dark wizard 6.6)" }
+          # ISCC.exe carries no version resource (0.0.0.0): read the installed version from the uninstall entry
+          $keys = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1",
+                  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1"
+          $dv = ($keys | ForEach-Object { (Get-ItemProperty $_ -ErrorAction SilentlyContinue).DisplayVersion } | Where-Object { $_ } | Select-Object -First 1)
+          "Inno Setup: $dv"
+          if ($dv -and ([version]($dv -replace '[^0-9.].*$', '') -lt [version]"6.7.0")) {
+            throw "Inno Setup $dv too old (WizardBackColor needs 6.7, dark wizard 6.6)"
+          }
           $ver = (Select-String -Path CMakeLists.txt -Pattern 'project\(SampleGrabber VERSION ([0-9.]+)\)').Matches[0].Groups[1].Value
           $pkg = (Resolve-Path $env:PKG).Path
           & $iscc "/DAppVersion=$ver" "/DPkgDir=$pkg" "/O$PWD\dist\setup" installer\SampleGrabber.iss
