@@ -77,6 +77,12 @@ Invoke-SelfTest "tools" @{ SG_TOOLS_SELFTEST = "1" } -TimeoutSec 900
 Invoke-SelfTest "grab-file"  @{ SG_GRAB_SELFTEST = $wav } -TimeoutSec 300
 Invoke-SelfTest "grab-range" @{ SG_GRAB_SELFTEST = $wav; SG_GRAB_RANGE = "0:02-0:08" } -TimeoutSec 300
 
+# Cancel while ffmpeg cuts a long file: no process of the job (whole tree) and no partial file may survive
+$longWav = Join-Path $Work "long120.wav"   # pure Python generator: keep it short for the CI runners
+& $py "$PSScriptRoot/make-test-wav.py" $longWav 120
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $longWav)) { throw "could not create the long test wav" }
+Invoke-SelfTest "grab-cancel" @{ SG_GRAB_SELFTEST = $longWav; SG_GRAB_RANGE = "0:05-1:55"; SG_GRAB_CANCEL_AFTER = "40" } -TimeoutSec 120
+
 foreach ($theme in "dark", "classic")
 {
     $shots = Join-Path $out "snapshots"

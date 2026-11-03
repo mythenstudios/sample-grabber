@@ -5,9 +5,8 @@
 #include "Downloader.h"
 #include "Storage.h"
 #include <juce_events/juce_events.h>
-#include <fstream>
-#include <map>
-#include <vector>
+#include <cstdio>
+#include <string>
 
 #if JUCE_LINUX || JUCE_MAC || JUCE_BSD
  #include <fcntl.h>
@@ -15,10 +14,8 @@
  #include <unistd.h>
 #endif
 
-#if JUCE_LINUX
- #include <signal.h>
- #include <sys/types.h>
- #include <unistd.h>
+#if JUCE_LINUX || JUCE_MAC
+ #include "ProcTree.h"
 #endif
 
 namespace
@@ -44,57 +41,6 @@ namespace
             return "VIDEO NEEDS A LOGIN - SAVE IT AND DROP THE FILE HERE";
         return text;
     }
-
-   #if JUCE_LINUX
-    std::string readProcFile (const std::string& path)
-    {
-        std::ifstream in (path, std::ios::binary);
-        return std::string ((std::istreambuf_iterator<char> (in)), std::istreambuf_iterator<char>());
-    }
-
-    // ChildProcess::kill() only hits the direct child. yt-dlp's release binary is a PyInstaller bootloader that runs
-    // the real yt-dlp as its child, which in turn runs ffmpeg for sections/conversion - those would keep running and
-    // writing. Find our child by its argv (JUCE exposes no pid) and SIGKILL it with all descendants.
-    void killProcessTree (const juce::StringArray& args)
-    {
-        if (args.isEmpty())
-            return;
-
-        std::string want;
-        for (const auto& a : args)
-        {
-            want += a.toStdString();
-            want.push_back ('\0');
-        }
-
-        std::map<int, int> parentOf;
-        for (const auto& d : juce::File ("/proc").findChildFiles (juce::File::findDirectories, false, "*", juce::File::FollowSymlinks::no))
-        {
-            const auto name = d.getFileName();
-            if (! name.containsOnly ("0123456789"))
-                continue;
-            const auto stat = readProcFile ("/proc/" + name.toStdString() + "/stat");
-            const auto close = stat.rfind (')');   // the command name may contain spaces and ')'
-            if (close == std::string::npos || close + 4 >= stat.size())
-                continue;
-            parentOf[name.getIntValue()] = std::atoi (stat.c_str() + close + 4);   // ") S <ppid>"
-        }
-
-        const int self = (int) ::getpid();
-        std::vector<int> tree;
-        for (const auto& [pid, ppid] : parentOf)
-            if (ppid == self && readProcFile ("/proc/" + std::to_string (pid) + "/cmdline") == want)
-                tree.push_back (pid);
-
-        for (size_t i = 0; i < tree.size(); ++i)   // breadth-first: append children of every collected pid
-            for (const auto& [pid, ppid] : parentOf)
-                if (ppid == tree[i])
-                    tree.push_back (pid);
-
-        for (const int pid : tree)
-            ::kill (pid, SIGKILL);
-    }
-   #endif
 }
 
 juce::File Downloader::dataDir (const juce::String& sub)
@@ -271,8 +217,8 @@ void Downloader::cancel()
         const juce::ScopedLock sl (procLock);
         if (proc != nullptr)
         {
-           #if JUCE_LINUX
-            killProcessTree (procArgs);
+           #if JUCE_LINUX || JUCE_MAC
+            sg::proctree::killTree (procArgs);   // ChildProcess::kill() only hits the direct child
            #endif
             proc->kill();   // Windows: WinProcess terminates its Job Object, i.e. the whole tree
         }

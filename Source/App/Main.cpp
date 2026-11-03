@@ -9,6 +9,7 @@
 #include "Downloader.h"
 #include "TimeRange.h"
 #include "UserSettings.h"
+#include "ProcTree.h"   // Linux/macOS only, empty elsewhere
 #include <cmath>
 #include <cstdlib>
 #include <functional>
@@ -700,26 +701,12 @@ namespace selftest
             log ("cancel took " + juce::String (now() - t, 0) + " ms, busy=" + juce::String ((int) dl.isBusy()));
             juce::Thread::sleep (500);
             int survivors = 0;
-           #if JUCE_LINUX
-            const auto marker = sg::storage::cacheRoot().getFullPathName();
-            for (const auto& d : juce::File ("/proc").findChildFiles (juce::File::findDirectories, false, "*", juce::File::FollowSymlinks::no))
-                if (d.getFileName().containsOnly ("0123456789"))
-                {
-                    juce::MemoryBlock mb;
-                    juce::FileInputStream in (d.getChildFile ("cmdline"));
-                    if (in.openedOk())
-                        in.readIntoMemoryBlock (mb);
-                    auto* bytes = static_cast<char*> (mb.getData());
-                    for (size_t i = 0; i < mb.getSize(); ++i)
-                        if (bytes[i] == 0)
-                            bytes[i] = ' ';   // argv separators
-                    const auto cmd = juce::String::fromUTF8 (bytes, (int) mb.getSize());
-                    if (cmd.contains (marker))
-                    {
-                        ++survivors;
-                        log ("still running: " + d.getFileName() + " " + cmd.substring (0, 100));
-                    }
-                }
+           #if JUCE_LINUX || JUCE_MAC
+            for (const auto& p : sg::proctree::findByMarker (sg::storage::cacheRoot().getFullPathName()))
+            {
+                ++survivors;
+                log ("still running: " + juce::String (p.pid) + " " + p.argv.joinIntoString (" ").substring (0, 100));
+            }
            #elif JUCE_WINDOWS
             // No other process' command line without reading its PEB: match by image instead (yt-dlp.exe, its
             // PyInstaller child of the same name, ffmpeg/ffprobe, deno) in our tools folder or wherever the tools resolve

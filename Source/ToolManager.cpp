@@ -9,6 +9,9 @@
 #if ! JUCE_WINDOWS
  #include <unistd.h>   // link(): hard link as a backup when replacing
 #endif
+#if JUCE_MAC
+ #include <sys/xattr.h>   // removexattr(): drop com.apple.quarantine from unpacked tools
+#endif
 
 namespace
 {
@@ -31,14 +34,41 @@ namespace
     const char* const kDenoTriple  = "x86_64-pc-windows-msvc";
     const char* const kFfmpegPlat  = "win64";
     const char* const kFfmpegExt   = ".zip";
+   #elif JUCE_MAC && JUCE_64BIT && JUCE_ARM
+    constexpr bool kSupported = true;
+    const char* const kYtDlpAsset  = "yt-dlp_macos";            // universal2, onefile
+    const char* const kDenoTriple  = "aarch64-apple-darwin";
+    const char* const kFfmpegPlat  = "";                        // not BtbN: see kRiedlPlat
+    const char* const kFfmpegExt   = ".zip";
    #else
-    // macOS etc.: not supported yet (stage 4), PATH fallback remains
+    // Intel macOS etc.: not supported, PATH fallback remains
     constexpr bool kSupported = false;
     const char* const kYtDlpAsset  = "";
     const char* const kDenoTriple  = "";
     const char* const kFfmpegPlat  = "";
     const char* const kFfmpegExt   = "";
    #endif
+
+    // macOS arm64: ffmpeg + ffprobe from Martin Riedl (Developer ID signed, team pinned), codesign for checks.
+    // Empty strings elsewhere; the code paths are runtime checks so Linux/Windows compile them too.
+   #if JUCE_MAC && JUCE_64BIT && JUCE_ARM
+    const char* const kRiedlPlat     = "macos/arm64";
+    const char* const kFfmpegTeamId  = "KU3N25YGLU";
+    const char* const kCodesign      = "/usr/bin/codesign";
+   #else
+    const char* const kRiedlPlat     = "";
+    const char* const kFfmpegTeamId  = "";
+    const char* const kCodesign      = "";
+   #endif
+
+    // GUI apps on macOS get a minimal PATH; use the system curl by absolute path there
+   #if JUCE_MAC
+    const char* const kCurl = "/usr/bin/curl";
+   #else
+    const char* const kCurl = "curl";
+   #endif
+
+    const char* const kRiedlHost = "https://ffmpeg.martin-riedl.de/";
 
    #if JUCE_WINDOWS
     const char* const kExeSuffix = ".exe";
@@ -129,6 +159,7 @@ namespace
     const char* const kErrBusy   = "GITHUB BUSY - TRY AGAIN IN A FEW MINUTES";
     const char* const kErrWrite  = "CANNOT WRITE TOOLS FOLDER";
     const char* const kErrCurl   = "CURL MISSING - INSTALL CURL";
+    const char* const kErrSign   = "SIGNATURE CHECK FAILED - NOT INSTALLED"; // macOS: codesign pin for ffmpeg
     const char* const kCancelled = "CANCELLED";
 
     const juce::String kSep = juce::String::fromUTF8 (" \xc2\xb7 ");      // middle dot as in the editor (kDot)
@@ -239,10 +270,11 @@ juce::String ToolManager::toolName (Tool t)
 bool ToolManager::isPlatformSupported()  { return kSupported; }
 
 // Linux: JUCE is built with JUCE_USE_CURL=0 -> juce::URL cannot do TLS there, hence the system curl.
+// macOS: /usr/bin/curl as well (https-only redirects, same code path as Linux).
 // SG_TOOLS_HTTP=juce forces juce::URL (testing only).
 bool ToolManager::useCurl()
 {
-   #if JUCE_LINUX
+   #if JUCE_LINUX || JUCE_MAC
     return juce::SystemStats::getEnvironmentVariable ("SG_TOOLS_HTTP", {}) != "juce";
    #else
     return false;
@@ -963,16 +995,17 @@ juce::Result ToolManager::getPlan (Tool t, Plan& plan, bool refetch)
 //==============================================================================
 // Latest version without the REST API (it only allows 60 requests/h per IP): github.com/<repo>/releases/latest
 // answers with 302 to .../releases/tag/<tag>; the redirect is NOT followed, only Location is read.
-juce::Result ToolManager::latestTag (const juce::String& repo, juce::String& tag)
+// One request without following redirects: status code + Location. curl always sends GET (body to /dev/null),
+// juce::URL uses httpCmd (github.com: HEAD; Riedl answers HEAD with 404 -> GET).
+juce::Result ToolManager::resolveRedirect (const juce::String& url, const juce::String& httpCmd, int& code, juce::String& location)
 {
-    const auto url = "https://github.com/" + repo + "/releases/latest";
-    juce::String location;
-    int code = 0;
+    code = 0;
+    location.clear();
 
     if (useCurl())
     {
         juce::String out;
-        const int rc = runTool ({ "curl", "-sS", "--proto", "=https", "--connect-timeout", "20", "--max-time", "40",
+        const int rc = runTool ({ kCurl, "-sS", "--proto", "=https", "--connect-timeout", "20", "--max-time", "40",
                                   "-A", kUserAgent, "-o", "/dev/null", "-w", "%{http_code} %{redirect_url}", url }, out, 60000);
         if (threadShouldExit())
             return juce::Result::fail (kCancelled);
@@ -987,7 +1020,7 @@ juce::Result ToolManager::latestTag (const juce::String& repo, juce::String& tag
         juce::StringPairArray headers;
         auto opts = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
                         .withExtraHeaders ("User-Agent: " + juce::String (kUserAgent))
-                        .withHttpRequestCmd ("HEAD")
+                        .withHttpRequestCmd (httpCmd)
                         .withConnectionTimeoutMs (20000)
                         .withNumRedirectsToFollow (0)
                         .withResponseHeaders (&headers)
@@ -997,6 +1030,18 @@ juce::Result ToolManager::latestTag (const juce::String& repo, juce::String& tag
             return juce::Result::fail (kErrNoNet);
         location = headers["Location"].trim();
     }
+    return juce::Result::ok();
+}
+
+juce::Result ToolManager::latestTag (const juce::String& repo, juce::String& tag)
+{
+    const auto url = "https://github.com/" + repo + "/releases/latest";
+    juce::String location;
+    int code = 0;
+
+    auto rr = resolveRedirect (url, "HEAD", code, location);
+    if (rr.failed())
+        return rr;
 
     if (code < 300 || code >= 400 || ! location.contains ("/releases/tag/"))
         return juce::Result::fail (httpError (code < 300 ? 0 : code));
@@ -1013,7 +1058,7 @@ juce::int64 ToolManager::headSize (const juce::String& url)
     if (useCurl())
     {
         juce::String out;
-        const int rc = runTool ({ "curl", "-sSIL", "--proto", "=https", "--proto-redir", "=https",
+        const int rc = runTool ({ kCurl, "-sSIL", "--proto", "=https", "--proto-redir", "=https",
                                   "--connect-timeout", "20", "--max-time", "40", "-A", kUserAgent, url }, out, 60000);
         if (rc != 0)
             return -1;
@@ -1066,6 +1111,48 @@ juce::Result ToolManager::makePlan (Tool t, Plan& plan)
             plan.version = tag.trimCharactersAtStart ("v");
         }
         plan.assetUrl = base + plan.assetName;
+        return juce::Result::ok();
+    }
+
+    // ffmpeg on macOS arm64 (Martin Riedl, release channel): redirect/latest/... answers 307 with the versioned folder
+    // download/<plat>/<unixts>_<version>/ffmpeg.zip. Checksums only exist there (<file>.sha256). ffprobe is taken from the
+    // SAME folder (no second redirect, both binaries always belong together).
+    if (juce::String (kRiedlPlat).isNotEmpty())
+    {
+        const auto prefix = juce::String (kRiedlHost) + "download/" + kRiedlPlat + "/";
+        int code = 0;
+        juce::String location;
+        auto rr = resolveRedirect (juce::String (kRiedlHost) + "redirect/latest/" + kRiedlPlat + "/release/ffmpeg.zip",
+                                   "GET", code, location);   // HEAD gives 404 there
+        if (rr.failed())
+            return rr;
+        if (code < 300 || code >= 400)
+        {
+            if (code == 0)                   return juce::Result::fail (kErrNoNet);
+            if (code == 429 || code >= 500)  return juce::Result::fail ("FFMPEG SERVER BUSY - TRY AGAIN IN A FEW MINUTES");
+            return juce::Result::fail ("FFMPEG SERVER ERROR " + juce::String (code));
+        }
+
+        // Accept only https://ffmpeg.martin-riedl.de/download/<plat>/<safe folder>/ffmpeg.zip
+        const juce::String unexpected ("UNEXPECTED ANSWER FROM FFMPEG SERVER");
+        if (! location.startsWith (prefix) || ! location.endsWith ("/ffmpeg.zip"))
+            return juce::Result::fail (unexpected);
+        const auto folder = location.substring (prefix.length()).upToLastOccurrenceOf ("/ffmpeg.zip", false, false);
+        if (! isSafeName (folder) || ! folder.containsChar ('_'))
+            return juce::Result::fail (unexpected);
+        const auto ver = folder.fromFirstOccurrenceOf ("_", false, false);
+        if (versionParts (ver).isEmpty())
+            return juce::Result::fail (unexpected);
+
+        const auto base = prefix + folder + "/";
+        plan.assetName  = "ffmpeg.zip";
+        plan.assetUrl   = base + plan.assetName;
+        plan.sumsUrl    = plan.assetUrl + ".sha256";
+        plan.asset2Name = "ffprobe.zip";
+        plan.asset2Url  = base + plan.asset2Name;
+        plan.sums2Url   = plan.asset2Url + ".sha256";
+        plan.version    = ver;            // full version (9.0.2): every new release counts as an update
+        plan.sizeViaHead = false;
         return juce::Result::ok();
     }
 
@@ -1129,43 +1216,64 @@ juce::Result ToolManager::prepareOne (const Plan& plan, const juce::String& step
     if (! tmp.createDirectory())
         return juce::Result::fail (kErrWrite);
 
-    // --- Download (size via HEAD for the bar; unknown -> moving stripe) ---
-    const auto archive = tmp.getChildFile (plan.assetName);
-    const auto sumsFile = tmp.getChildFile ("sums.txt");
-    setStatus ("DOWNLOADING " + upper, -1.0f);
-
-    juce::Result r = juce::Result::ok();
-    if (plan.sumsText.isNotEmpty())
-        sumsFile.replaceWithText (plan.sumsText);
-    else
-        r = download (plan.sumsUrl, sumsFile, -1, nullptr);
-    if (r.failed())
-        return r;
-
-    const auto size = headSize (plan.assetUrl);
-    r = download (plan.assetUrl, archive, size, [this, upper, size] (juce::int64 n)
+    // --- Download (size via HEAD for the bar; unknown -> moving stripe) + SHA-256 (mandatory) ---
+    // Second archive (macOS ffmpeg: ffprobe.zip) goes through exactly the same steps.
+    auto fetch = [&] (const juce::String& name, const juce::String& url, const juce::String& sumsUrl,
+                      const juce::String& sumsText, const juce::String& sumsName, juce::String& sha) -> juce::Result
     {
-        setStatus ("DOWNLOADING " + upper, size > 0 ? (float) juce::jlimit (0.0, 1.0, (double) n / (double) size) : -1.0f);
-    });
+        const auto archiveFile = tmp.getChildFile (name);
+        const auto sumsFile = tmp.getChildFile (sumsName);
+        setStatus ("DOWNLOADING " + upper, -1.0f);
+
+        juce::Result fr = juce::Result::ok();
+        if (sumsText.isNotEmpty())
+            sumsFile.replaceWithText (sumsText);
+        else
+            fr = download (sumsUrl, sumsFile, -1, nullptr);
+        if (fr.failed())
+            return fr;
+
+        const auto size = plan.sizeViaHead ? headSize (url) : (juce::int64) -1;
+        fr = download (url, archiveFile, size, [this, upper, size] (juce::int64 n)
+        {
+            setStatus ("DOWNLOADING " + upper, size > 0 ? (float) juce::jlimit (0.0, 1.0, (double) n / (double) size) : -1.0f);
+        });
+        if (fr.failed())
+            return fr;
+
+        setStatus ("CHECKING " + upper, -1.0f);
+        auto expected = findExpectedHash (sumsFile.loadFileAsString(), name);
+        if (! isHex64 (expected))
+            return juce::Result::fail (kErrCheck);
+
+        // Test helper: SG_TOOLS_FAKE_BAD_SHA=1 or =<tool> falsifies the expected checksum
+        const auto fake = juce::SystemStats::getEnvironmentVariable ("SG_TOOLS_FAKE_BAD_SHA", {});
+        if (fake == "1" || fake == toolName (t))
+            expected = juce::String::repeatedString ("0", 64);
+
+        sha = juce::SHA256 (archiveFile).toHexString().toLowerCase();
+        if (threadShouldExit())
+            return juce::Result::fail (kCancelled);
+        if (sha != expected)
+            return juce::Result::fail (kErrCheck);
+        return juce::Result::ok();
+    };
+
+    const auto archive = tmp.getChildFile (plan.assetName);
+    const auto archive2 = plan.asset2Name.isNotEmpty() ? tmp.getChildFile (plan.asset2Name) : juce::File();
+    if (plan.asset2Name == plan.assetName || plan.asset2Name.containsChar ('/'))
+        return juce::Result::fail (kErrCheck);   // never: plan is built from fixed names
+
+    juce::String actual, actual2;
+    auto r = fetch (plan.assetName, plan.assetUrl, plan.sumsUrl, plan.sumsText, "sums.txt", actual);
     if (r.failed())
         return r;
-
-    // --- SHA-256 (mandatory) ---
-    setStatus ("CHECKING " + upper, -1.0f);
-    auto expected = findExpectedHash (sumsFile.loadFileAsString(), plan.assetName);
-    if (! isHex64 (expected))
-        return juce::Result::fail (kErrCheck);
-
-    // Test helper: SG_TOOLS_FAKE_BAD_SHA=1 or =<tool> falsifies the expected checksum
-    const auto fake = juce::SystemStats::getEnvironmentVariable ("SG_TOOLS_FAKE_BAD_SHA", {});
-    if (fake == "1" || fake == toolName (t))
-        expected = juce::String::repeatedString ("0", 64);
-
-    const auto actual = juce::SHA256 (archive).toHexString().toLowerCase();
-    if (threadShouldExit())
-        return juce::Result::fail (kCancelled);
-    if (actual != expected)
-        return juce::Result::fail (kErrCheck);
+    if (plan.asset2Name.isNotEmpty())
+    {
+        r = fetch (plan.asset2Name, plan.asset2Url, plan.sums2Url, {}, "sums2.txt", actual2);
+        if (r.failed())
+            return r;
+    }
 
     // --- Unpack: list (file in tmp, target name in bin folder) ---
     auto& staged = st.files;
@@ -1186,6 +1294,23 @@ juce::Result ToolManager::prepareOne (const Plan& plan, const juce::String& step
         if (zr.failed())
             return juce::Result::fail ("UNPACKING FAILED");
         staged.add ({ out.getChildFile (mainExe (t)), mainExe (t) });
+    }
+    else if (plan.asset2Name.isNotEmpty())
+    {
+        // macOS (Riedl): one zip per program, the binary sits in the root of the zip
+        const auto out = tmp.getChildFile ("x");
+        const std::pair<juce::File, juce::String> zips[] = { { archive, exeName ("ffmpeg") }, { archive2, exeName ("ffprobe") } };
+        for (auto& z : zips)
+        {
+            juce::ZipFile zip (z.first);
+            const int idx = zip.getIndexOfFileName (z.second);
+            if (idx < 0)
+                return juce::Result::fail ("UNPACKING FAILED");
+            auto zr = zip.uncompressEntry (idx, out, juce::ZipFile::OverwriteFiles::yes, juce::ZipFile::FollowSymlinks::no);
+            if (zr.failed())
+                return juce::Result::fail ("UNPACKING FAILED");
+            staged.add ({ out.getChildFile (z.second), z.second });
+        }
     }
     else
     {
@@ -1229,6 +1354,31 @@ juce::Result ToolManager::prepareOne (const Plan& plan, const juce::String& step
         if (s.first.isSymbolicLink())
             return juce::Result::fail (kErrCheck);   // link in the archive: never install
         s.first.setExecutePermission (true);
+       #if JUCE_MAC
+        // Never let Gatekeeper ask about our own tools; errors (no attribute) do not matter
+        ::removexattr (s.first.getFullPathName().toRawUTF8(), "com.apple.quarantine", 0);
+       #endif
+    }
+
+    // --- macOS: ffmpeg/ffprobe must carry the builder's Developer ID signature (team pinned), no fallback ---
+    if (t == Tool::ffmpeg && juce::String (kFfmpegTeamId).isNotEmpty())
+    {
+        setStatus ("CHECKING SIGNATURE " + upper, -1.0f);
+        const auto requirement = "-R=anchor apple generic and certificate leaf[subject.OU] = \""
+                                 + juce::String (kFfmpegTeamId) + "\"";
+        for (auto& s : staged)
+        {
+            juce::String output;
+            const int rc = runTool ({ kCodesign, "--verify", "--strict", requirement, s.first.getFullPathName() }, output, 120000);
+            if (threadShouldExit())
+                return juce::Result::fail (kCancelled);
+            if (rc != 0)
+            {
+                std::cerr << "[SG-TOOLS] codesign check failed (" << rc << ") for " << s.second.toStdString() << ": "
+                          << output.trim().toStdString() << std::endl;
+                return juce::Result::fail (kErrSign);
+            }
+        }
     }
 
     // --- Test run with the new file (before replacing) ---
@@ -1236,18 +1386,44 @@ juce::Result ToolManager::prepareOne (const Plan& plan, const juce::String& step
     juce::String probe;
     for (auto& s : staged)
     {
-        juce::String output;
         const auto flag = t == Tool::ffmpeg ? "-version" : "--version";
-        const int rc = runTool ({ s.first.getFullPathName(), flag }, output, 60000);
+        auto probeRun = [&] (juce::String& output)
+        {
+            const int rc = runTool ({ s.first.getFullPathName(), flag }, output, 60000);
+            return rc == 0 && output.trim().isNotEmpty();
+        };
+        juce::String output;
+        bool started = probeRun (output);
         if (threadShouldExit())
             return juce::Result::fail (kCancelled);
-        if (rc != 0 || output.trim().isEmpty())
+
+        // macOS (yt-dlp/deno only): the kernel may kill an arm64 binary without a valid signature -> sign ad hoc once
+        // and try again. Never for ffmpeg (its Developer ID signature was pinned above and must stay intact).
+        if (! started && t != Tool::ffmpeg && juce::String (kCodesign).isNotEmpty())
+        {
+            juce::String signOut;
+            const int src = runTool ({ kCodesign, "--force", "--sign", "-", s.first.getFullPathName() }, signOut, 120000);
+            std::cerr << "[SG-TOOLS] " << s.second.toStdString() << " did not start, ad-hoc signing: rc=" << src << " "
+                      << signOut.trim().toStdString() << std::endl;
+            if (threadShouldExit())
+                return juce::Result::fail (kCancelled);
+            if (src == 0)
+            {
+                output.clear();
+                started = probeRun (output);
+                if (threadShouldExit())
+                    return juce::Result::fail (kCancelled);
+            }
+        }
+
+        if (! started)
             return juce::Result::fail ("DOES NOT START ON THIS SYSTEM");
         if (probe.isEmpty())
             probe = juce::StringArray::fromLines (output.trim())[0].trim().substring (0, 60);
     }
 
     st.sha = actual;
+    st.sha2 = actual2;
     st.probe = probe;
     return juce::Result::ok();
 }
@@ -1320,12 +1496,12 @@ juce::Result ToolManager::commitOne (const Plan& plan, const Staged& st)
         if (d.backup != juce::File())
             d.backup.deleteFile();   // Windows: fails while the old program is running -> clean up in the next run
 
-    writeToolRecord (plan, st.sha);
+    writeToolRecord (plan, st.sha, st.sha2);
     setToolState (plan.tool, State::ok, st.probe);
     return juce::Result::ok();
 }
 
-void ToolManager::writeToolRecord (const Plan& plan, const juce::String& sha)
+void ToolManager::writeToolRecord (const Plan& plan, const juce::String& sha, const juce::String& sha2)
 {
     auto xml = loadXml();
     auto* e = xml->getChildByAttribute ("id", toolName (plan.tool));
@@ -1337,6 +1513,11 @@ void ToolManager::writeToolRecord (const Plan& plan, const juce::String& sha)
     e->setAttribute ("version", plan.version);
     e->setAttribute ("asset", plan.assetName);
     e->setAttribute ("sha256", sha);
+    // Second archive (macOS: ffprobe.zip). Old entries without it stay readable; removed when not applicable.
+    if (sha2.isNotEmpty())
+        e->setAttribute ("sha256probe", sha2);
+    else
+        e->removeAttribute ("sha256probe");
     e->setAttribute ("installed", juce::String (juce::Time::currentTimeMillis()));
     e->setAttribute ("latest", plan.version);
     xml->writeTo (toolsDir().getChildFile ("tools.xml"));
@@ -1353,7 +1534,7 @@ juce::Result ToolManager::download (const juce::String& url, const juce::File& d
     if (useCurl())
     {
         // Without -f: the error page ends up in dest (rate-limit text), status code of the last response via -w on stdout
-        const juce::StringArray args { "curl", "-sSL", "--proto", "=https", "--proto-redir", "=https",
+        const juce::StringArray args { kCurl, "-sSL", "--proto", "=https", "--proto-redir", "=https",
                                        "--connect-timeout", "20", "--retry", "2",
                                        "-A", kUserAgent, "-H", "Accept: application/octet-stream, application/json",
                                        "-w", "%{http_code}", "-o", dest.getFullPathName(), url };

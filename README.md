@@ -78,7 +78,7 @@ Early development. Expect rough edges and breaking changes between commits.
 | Windows 10/11 x64 | Works. Installer, tested in FL Studio and Ableton Live on Windows 11 |
 | Linux x86_64 | Works. Built on Ubuntu 22.04 (glibc 2.35), tested on Ubuntu 26.04 in Ardour, Reaper and Bitwig |
 | Windows ARM64, Linux ARM64 | Planned |
-| macOS (Apple Silicon) | Planned |
+| macOS (Apple Silicon) | Planned. Tool installer for Apple Silicon (Intel Macs: put yt-dlp and ffmpeg in PATH) |
 
 Known limitations on Linux: in Bitwig, dropping a file *onto the plugin window* does not reach the plugin
 (Bitwig keeps the drop) - paste the file path into the link field instead. Dragging pads *out* works everywhere.
@@ -164,6 +164,7 @@ The installer is built from `installer/SampleGrabber.iss` (see the comment at it
 | [deno](https://github.com/denoland/deno) | JavaScript runtime for yt-dlp (YouTube) | MIT |
 | [Inno Setup](https://jrsoftware.org/isinfo.php) | Windows installer (build tool, not part of the app) | Inno Setup License |
 | [FFmpeg](https://ffmpeg.org) ([BtbN builds](https://github.com/BtbN/FFmpeg-Builds), LGPL variant) | Decoding / conversion (separate process) | LGPL 2.1+ |
+| [FFmpeg](https://ffmpeg.martin-riedl.de) (Martin Riedl builds, macOS Apple Silicon: ffmpeg + ffprobe, Developer ID signed; the app verifies SHA-256 and signature Team ID) | Decoding / conversion on macOS (separate process) | GPLv3 (built with `--enable-gpl --enable-version3`) |
 
 The external tools are never bundled with Sample Grabber. They are downloaded by the user's machine from their official releases and run as separate programs.
 

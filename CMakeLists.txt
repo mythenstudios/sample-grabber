@@ -62,6 +62,7 @@ set(SG_SOURCES
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
     Source/Downloader.cpp
+    Source/ProcTree.cpp
     Source/ToolManager.cpp
     Source/Storage.cpp)
 

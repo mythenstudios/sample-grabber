@@ -11,6 +11,8 @@
 // Install and update external tools (yt-dlp, deno, ffmpeg + ffprobe) ourselves.
 //  - Official sources only (GitHub releases of yt-dlp/yt-dlp, denoland/deno, BtbN/FFmpeg-Builds), verified via SHA-256.
 //    github.com URLs only, not the REST API (60 requests/h per IP).
+//    macOS arm64: ffmpeg + ffprobe from ffmpeg.martin-riedl.de (release channel), SHA-256 from the versioned folder,
+//    plus codesign check pinned to the builder's Developer ID team.
 //  - Folder: <user data folder>/SampleGrabber/bin (Windows: LOCALAPPDATA), test override SG_TOOLS_DIR.
 //  - One object per process (juce::SharedResourcePointer<ToolManager>), installations protected across processes
 //    by juce::InterProcessLock (VST3 and standalone at the same time).
@@ -97,6 +99,9 @@ private:
         juce::String assetName, assetUrl;   // fixed tag URL on github.com (BtbN: rolling "latest")
         juce::String sumsUrl, sumsText;     // checksum file; sumsText already loaded (ffmpeg)
         juce::String version;
+        // Optional second archive (macOS ffmpeg: ffprobe.zip from the same versioned folder), empty = none
+        juce::String asset2Name, asset2Url, sums2Url;
+        bool sizeViaHead = true;            // false: server does not answer HEAD (Riedl) -> indeterminate bar
     };
 
     void run() override;
@@ -106,7 +111,7 @@ private:
     {
         juce::File tmpDir;
         juce::Array<std::pair<juce::File, juce::String>> files;   // (file in tmp, target name in bin folder)
-        juce::String sha, probe;
+        juce::String sha, sha2, probe;     // sha2: second archive (empty = none)
     };
 
     void doInstall (const juce::Array<Tool>& targets, juce::String& note, bool& isError, int maxWaitMs);
@@ -118,6 +123,7 @@ private:
     void releaseExternalGate();
 
     static bool useCurl();
+    juce::Result resolveRedirect (const juce::String& url, const juce::String& httpCmd, int& code, juce::String& location);
     juce::Result latestTag (const juce::String& repo, juce::String& tag);
     juce::int64 headSize (const juce::String& url);
     juce::Result makePlan (Tool, Plan&);
@@ -130,7 +136,7 @@ private:
 
     void setStatus (const juce::String& text, float p);
     void setToolState (Tool, State, const juce::String& message);
-    void writeToolRecord (const Plan&, const juce::String& sha);
+    void writeToolRecord (const Plan&, const juce::String& sha, const juce::String& sha2);
     std::unique_ptr<juce::XmlElement> loadXml() const;
     bool toolSelected (Tool) const;                 // SG_TOOLS_ONLY (test filter)
 

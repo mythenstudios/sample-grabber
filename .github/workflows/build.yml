@@ -181,11 +181,11 @@ jobs:
           auval -a | grep -i "Sgrb" || true
           auval -v aumu Sgrb Wrst
 
-      # No tool installer on macOS yet: skip the tests that need yt-dlp/ffmpeg (proc skips itself off Windows)
+      # Tool installer on macOS arm64: same self tests as Windows (proc skips itself off Windows)
       - name: Self tests
         if: ${{ !cancelled() }}
         shell: pwsh
-        run: ./scripts/ci/selftests.ps1 -App "build/SampleGrabberApp_artefacts/Release/Sample Grabber.app/Contents/MacOS/Sample Grabber" -Work "${{ runner.temp }}/sg-selftest" -Skip tools,grab-file,grab-range
+        run: ./scripts/ci/selftests.ps1 -App "build/SampleGrabberApp_artefacts/Release/Sample Grabber.app/Contents/MacOS/Sample Grabber" -Work "${{ runner.temp }}/sg-selftest"
 
       - uses: actions/upload-artifact@v7
         if: always()
