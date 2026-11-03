@@ -121,7 +121,7 @@ jobs:
 
   # Apple Silicon: standalone app, VST3 and AU, ad-hoc signed (no Apple developer account yet)
   macos-arm64:
-    runs-on: macos-15
+    runs-on: macos-26   # macos-15 queue overloaded since macos-14 retired (2026-11-02); deployment target stays 11.0
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
