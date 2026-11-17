@@ -1463,7 +1463,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout SampleGrabberProcessor::crea
 
     layout.add (std::make_unique<juce::AudioParameterFloat> (
         juce::ParameterID { "speed", 1 }, "Speed",
-        juce::NormalisableRange<float> (50.0f, 200.0f, 0.1f), 100.0f));
+        // Logarithmic 50..200 %: 100 % sits in the centre of the knob, half and double speed are equally far away
+        juce::NormalisableRange<float> (50.0f, 200.0f,
+            [] (float start, float end, float x) { return start * std::pow (end / start, x); },
+            [] (float start, float end, float v) { return std::log (v / start) / std::log (end / start); },
+            [] (float start, float end, float v) { return juce::jlimit (start, end, std::round (v * 10.0f) / 10.0f); }),
+        100.0f));
 
     // Fades in % of the region (pad or selection), new IDs: old ms values ("fadeIn"/"fadeOut") are not read as %.
     // Skew: 10 % at the knob centre -> the lower half of the travel covers the short, frequently used fades finely.

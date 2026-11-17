@@ -112,9 +112,19 @@ namespace ui
                 semiBold = load (BinaryData::InterSemiBold_ttf,      BinaryData::InterSemiBold_ttfSize);
                 mono     = load (BinaryData::JetBrainsMonoMedium_ttf, BinaryData::JetBrainsMonoMedium_ttfSize);
                #endif
+
+                // The brand fonts have a smaller cap height per font height than the system default font
+                // (Classic), so the same size looked smaller in Dark (strongly on macOS). Scale them so the
+                // cap height matches the default font of this system.
+                const float refRegular = capHeight (juce::Font (juce::FontOptions (100.0f)));
+                const float refBold    = capHeight (juce::Font (juce::FontOptions (100.0f, juce::Font::bold)));
+                mediumScale   = scaleFor (medium,   refRegular);
+                semiBoldScale = scaleFor (semiBold, refBold);
+                monoScale     = scaleFor (mono,     refRegular);
             }
 
             juce::Typeface::Ptr regular, medium, semiBold, mono;   // nullptr = not available -> default font
+            float mediumScale = 1.0f, semiBoldScale = 1.0f, monoScale = 1.0f;   // size factor vs. the default font
 
         private:
             [[maybe_unused]] static juce::Typeface::Ptr load (const char* data, int size)
@@ -122,6 +132,25 @@ namespace ui
                 if (data == nullptr || size <= 0)
                     return nullptr;
                 return juce::Typeface::createSystemTypefaceFor (data, (size_t) size);
+            }
+
+            // Height of the glyph outline of "H" (not the line box), 0 if not measurable
+            static float capHeight (const juce::Font& f)
+            {
+                juce::GlyphArrangement ga;
+                ga.addLineOfText (f, "H", 0.0f, 0.0f);
+                juce::Path path;
+                ga.createPath (path);
+                return path.getBounds().getHeight();
+            }
+
+            // Clamped so a broken measurement cannot blow up the layout
+            static float scaleFor (const juce::Typeface::Ptr& tf, float reference)
+            {
+                if (tf == nullptr || reference <= 0.0f)
+                    return 1.0f;
+                const float own = capHeight (juce::Font (juce::FontOptions (tf).withHeight (100.0f)));
+                return own > 0.0f ? juce::jlimit (1.0f, 1.4f, reference / own) : 1.0f;
             }
         };
 
@@ -172,7 +201,7 @@ namespace ui
             return juce::Font (juce::FontOptions (size).withKerningFactor (0.08f));
 
         detail::FontCachePtr fonts;
-        return detail::fontFrom (fonts->medium, size, juce::FontOptions (size));
+        return detail::fontFrom (fonts->medium, size * fonts->mediumScale, juce::FontOptions (size));
     }
 
     inline juce::Font strong (float size)
@@ -181,7 +210,7 @@ namespace ui
             return juce::Font (juce::FontOptions (size, juce::Font::bold).withKerningFactor (0.08f));
 
         detail::FontCachePtr fonts;
-        return detail::fontFrom (fonts->semiBold, size, juce::FontOptions (size, juce::Font::bold));
+        return detail::fontFrom (fonts->semiBold, size * fonts->semiBoldScale, juce::FontOptions (size, juce::Font::bold));
     }
 
     // Mono for values (Dark: JetBrains Mono Medium, Classic: the previous label font)
@@ -192,14 +221,13 @@ namespace ui
             return label (size);
 
         detail::FontCachePtr fonts;
-        return detail::fontFrom (fonts->mono, size, juce::FontOptions (size), kerning);
+        return detail::fontFrom (fonts->mono, size * fonts->monoScale, juce::FontOptions (size), kerning);
     }
 
-    // Mono for readable lines (status line, overlay): JetBrains Mono (Dark) looks noticeably smaller at the same height
-    // than the Classic font. Factor measured against cap height in the snapshot (Dark vs Classic).
+    // Mono for readable lines (status line, overlay). The cap height is matched to Classic in mono() itself.
     inline juce::Font monoUi (float size)
     {
-        return mono (theme() == ThemeId::dark ? size * 1.15f : size);
+        return mono (size);
     }
 
     // Default sans font for JUCE's own texts (Dark: Inter Medium, Classic: nullptr = system default)

@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
+# macOS: Apple Silicon needs 11.0 anyway; must be set before project()
+set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 project(SampleGrabber VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -60,6 +62,7 @@ set(SG_SOURCES
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
     Source/Downloader.cpp
+    Source/ProcTree.cpp
     Source/ToolManager.cpp
     Source/Storage.cpp)
 
@@ -99,7 +102,12 @@ set(SG_ICON_ARGS
     ICON_BIG   brand/icon/icon-1024.png
     ICON_SMALL brand/icon/icon-256.png)
 
-# ---------------------------------------------------------------- VST3 plugin
+# ---------------------------------------------------------------- Plugin (VST3, on macOS also AU)
+set(SG_FORMATS VST3)
+if(APPLE)
+    list(APPEND SG_FORMATS AU)
+endif()
+
 juce_add_plugin(SampleGrabber
     COMPANY_NAME "Mythen Studios"
     BUNDLE_ID com.mythenstudios.samplegrabber
@@ -108,7 +116,7 @@ juce_add_plugin(SampleGrabber
     NEEDS_MIDI_INPUT TRUE
     PLUGIN_MANUFACTURER_CODE Wrst
     PLUGIN_CODE Sgrb
-    FORMATS VST3
+    FORMATS ${SG_FORMATS}
     ${SG_ICON_ARGS}
     PRODUCT_NAME "Sample Grabber")
 
@@ -139,7 +147,7 @@ juce_add_gui_app(SampleGrabberApp
     COMPANY_NAME "Mythen Studios"
     BUNDLE_ID com.mythenstudios.samplegrabberapp
     ${SG_ICON_ARGS}
-    VERSION 0.1.0)
+    VERSION ${PROJECT_VERSION})   # single source: project() above
 
 target_sources(SampleGrabberApp PRIVATE Source/App/Main.cpp ${SG_SOURCES})
 target_include_directories(SampleGrabberApp PRIVATE Source)

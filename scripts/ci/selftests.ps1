@@ -2,12 +2,14 @@
 # Copyright (C) 2026 Mythen Studios <hello@mythenstudios.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# Runs the app's built-in self tests on Windows (CI). All app folders point into a scratch directory.
-# Usage: selftests.ps1 -App <path to Sample Grabber.exe> -Work <scratch dir>
+# Runs the app's built-in self tests in CI (Windows, macOS). All app folders point into a scratch directory.
+# Usage: selftests.ps1 -App <path to the app executable> -Work <scratch dir> [-Skip name,name] [-Only name,name]
 # Exit code 0 = all tests passed. Logs and snapshot PNGs end up in <Work>/out.
 param(
     [Parameter(Mandatory)] [string] $App,
-    [Parameter(Mandatory)] [string] $Work
+    [Parameter(Mandatory)] [string] $Work,
+    [string[]] $Skip = @(),  # e.g. tools,grab-file,grab-range where the tool installer is not supported yet
+    [string[]] $Only = @()   # run only these tests (canary: tools,grab-file)
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,7 +21,8 @@ $logs = Join-Path $out "logs"
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 
 $wav = Join-Path $Work "loop124.wav"
-python "$PSScriptRoot/make-test-wav.py" $wav 20
+$py = if ($IsWindows) { "python" } else { "python3" }   # python3 on Windows may be the Microsoft Store stub
+& $py "$PSScriptRoot/make-test-wav.py" $wav 20
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $wav)) { throw "could not create the test wav" }
 
 $tools = Join-Path $Work "tools"
@@ -28,6 +31,7 @@ $results = [System.Collections.Generic.List[object]]::new()
 # Runs the app once with the given variables, waits (with timeout), prints stderr, records the result
 function Invoke-SelfTest([string] $Name, [hashtable] $Vars, [int] $TimeoutSec = 120, [scriptblock] $Check = $null)
 {
+    if ($Skip -contains $Name -or ($Only.Count -gt 0 -and $Only -notcontains $Name)) { Write-Host "skipped: $Name"; return }
     $base = Join-Path $Work $Name
     $all = @{
         SG_CACHE_DIR  = Join-Path $base "cache"
@@ -61,7 +65,7 @@ function Invoke-SelfTest([string] $Name, [hashtable] $Vars, [int] $TimeoutSec = 
 
 Invoke-SelfTest "range"  @{ SG_RANGE_SELFTEST = "1" }
 Invoke-SelfTest "cache"  @{ SG_CACHE_SELFTEST = "1" }
-Invoke-SelfTest "state"  @{ SG_STATE_SELFTEST = $wav; SG_SELFTEST_TMP = (Join-Path $Work "state\tmp") }
+Invoke-SelfTest "state"  @{ SG_STATE_SELFTEST = $wav; SG_SELFTEST_TMP = (Join-Path (Join-Path $Work "state") "tmp") }
 Invoke-SelfTest "export" @{ SG_EXPORT_SELFTEST = $wav }
 
 # Windows process tree: quoting round trip, kill() and destroying a running process leave nothing behind
@@ -73,6 +77,14 @@ Invoke-SelfTest "tools" @{ SG_TOOLS_SELFTEST = "1" } -TimeoutSec 900
 # Local file only: YouTube blocks CI addresses. Runs ffmpeg through the job object process code.
 Invoke-SelfTest "grab-file"  @{ SG_GRAB_SELFTEST = $wav } -TimeoutSec 300
 Invoke-SelfTest "grab-range" @{ SG_GRAB_SELFTEST = $wav; SG_GRAB_RANGE = "0:02-0:08" } -TimeoutSec 300
+
+# Cancel while ffmpeg cuts a long file: no process of the job (whole tree) and no partial file may survive
+$longWav = Join-Path $Work "long120.wav"   # pure Python generator: keep it short for the CI runners
+if (-not ($Skip -contains "grab-cancel" -or ($Only.Count -gt 0 -and $Only -notcontains "grab-cancel"))) {
+    & $py "$PSScriptRoot/make-test-wav.py" $longWav 120
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $longWav)) { throw "could not create the long test wav" }
+}
+Invoke-SelfTest "grab-cancel" @{ SG_GRAB_SELFTEST = $longWav; SG_GRAB_RANGE = "0:05-1:55"; SG_GRAB_CANCEL_AFTER = "40" } -TimeoutSec 120
 
 foreach ($theme in "dark", "classic")
 {

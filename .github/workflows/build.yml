@@ -2,8 +2,10 @@ name: build
 
 on:
   push:
-    branches: [main, "win/**"]
-    # Docs-only pushes (README, screenshots, badges) need no build
+    branches: [main, "win/**", "mac/**"]
+    # Release candidates and releases: v0.1.0-rc1, v0.1.0 (see the release job at the end)
+    tags: ["v*"]
+    # Docs-only pushes (README, screenshots, badges) need no build. GitHub ignores path filters for tag pushes.
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -20,7 +22,55 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Tags only: checks the tag against the CMake version before anything is built (release job uses the result).
+  # Promoting a release candidate (gh release edit --tag v0.1.0 ...) creates the final tag; if that tag push starts
+  # this workflow, nothing is rebuilt: the published release already carries the tested files of the candidate.
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.ref_type == 'tag'
+
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          skip=false
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+            if [ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || true)" = false ]; then
+              echo "::notice::release $tag is already published - no rebuild"
+              skip=true
+            fi
+            case "$tag" in
+              v*)
+                if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$'; then
+                  echo "::error::tag '$tag' is not v<major>.<minor>.<patch> or v<major>.<minor>.<patch>-rc<N>"; exit 1
+                fi
+                ver="${tag#v}"; ver="${ver%%-rc*}"
+                cmake_ver=$(sed -n 's/^project(SampleGrabber VERSION \([0-9][0-9.]*\).*/\1/p' CMakeLists.txt)
+                if [ "$ver" != "$cmake_ver" ]; then
+                  echo "::error::tag $tag is version $ver, CMakeLists.txt says $cmake_ver - bump the version, commit, tag again"; exit 1
+                fi
+                pre=false
+                case "$tag" in *-rc*) pre=true ;; esac
+                echo "tag $tag -> version $ver (prerelease: $pre)"
+                { echo "version=$ver"; echo "prerelease=$pre"; } >> "$GITHUB_OUTPUT"
+                ;;
+            esac
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
   windows-x64:
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     # Pinned: windows-latest moved to Visual Studio 2026, JUCE 8.0.4 is only known to build with VS 2022
     runs-on: windows-2022
     timeout-minutes: 60
@@ -66,7 +116,7 @@ jobs:
           if ($dv -and ([version]($dv -replace '[^0-9.].*$', '') -lt [version]"6.7.0")) {
             throw "Inno Setup $dv too old (WizardBackColor needs 6.7, dark wizard 6.6)"
           }
-          $ver = (Select-String -Path CMakeLists.txt -Pattern 'project\(SampleGrabber VERSION ([0-9.]+)\)').Matches[0].Groups[1].Value
+          $ver = (Select-String -Path CMakeLists.txt -Pattern 'project\(SampleGrabber VERSION ([0-9][0-9.]*)').Matches[0].Groups[1].Value
           $pkg = (Resolve-Path $env:PKG).Path
           & $iscc "/DAppVersion=$ver" "/DPkgDir=$pkg" "/O$PWD\dist\setup" installer\SampleGrabber.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
@@ -98,23 +148,241 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # Cross-check: Windows changes must not break the Linux build
+  # Release package for Linux x86_64. Built inside ubuntu:22.04 so the binaries need at most glibc 2.35
+  # (package-linux.sh fails otherwise). Self tests run on the same build (unstripped binary, same code).
   linux-x64:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    timeout-minutes: 75
     steps:
+      # git before checkout: without it actions/checkout falls back to a tarball (no .git, package-linux.sh needs it)
+      - name: Git
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
+
       - uses: actions/checkout@v7
 
       - name: Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
-            libasound2-dev libjack-jackd2-dev libfreetype-dev libfontconfig1-dev \
-            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev \
-            libxrandr-dev libxrender-dev libglu1-mesa-dev mesa-common-dev
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          bash scripts/ci/linux-deps.sh
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
+      # Builds (incremental), strips, checks the glibc/libstdc++ baseline, packs dist/*.tar.gz
+      - name: Build and package
+        run: |
+          bash scripts/package-linux.sh
+          pkg=$(ls dist/sample-grabber-*-linux-x86_64.tar.gz)
+          tar -tzf "$pkg" | head -30
+          echo "PKG=$pkg" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sample-grabber-linux-x64
+          path: ${{ env.PKG }}
+          retention-days: 14
+
+      # Relative work dir on purpose: runner.temp/github.workspace give host paths inside container jobs
+      - name: Self tests
+        if: ${{ !cancelled() }}
+        run: xvfb-run -a -s "-screen 0 1920x1200x24" bash scripts/ci/selftests.sh --app "build/SampleGrabberApp_artefacts/Release/Sample Grabber" --work sg-selftest
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: selftest-linux-x64
+          path: sg-selftest/out
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Apple Silicon: standalone app, VST3 and AU, ad-hoc signed (no Apple developer account yet)
+  macos-arm64:
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
+    runs-on: macos-26   # macos-15 queue overloaded since macos-14 retired (2026-11-02); deployment target stays 11.0
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
+
       - name: Build
-        run: cmake --build build --target SampleGrabber_VST3 SampleGrabberApp
+        run: cmake --build build --target SampleGrabber_VST3 SampleGrabber_AU SampleGrabberApp
+
+      # Ninja builds carry only the linker's ad-hoc signature on the binary; sign the whole bundles (Info.plist, resources)
+      - name: Ad-hoc sign
+        run: |
+          set -euo pipefail
+          for b in "build/SampleGrabberApp_artefacts/Release/Sample Grabber.app" \
+                   "build/SampleGrabber_artefacts/Release/VST3/Sample Grabber.vst3" \
+                   "build/SampleGrabber_artefacts/Release/AU/Sample Grabber.component"; do
+            codesign --force --deep -s - "$b"
+          done
+
+      # The bundles go into a zip made with ditto: upload-artifact drops the executable bits and symlinks
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="sample-grabber-${GITHUB_SHA::7}-macos-arm64"
+          out="dist/$name"
+          mkdir -p "$out"
+          cp -R "build/SampleGrabberApp_artefacts/Release/Sample Grabber.app" "$out/"
+          cp -R "build/SampleGrabber_artefacts/Release/VST3/Sample Grabber.vst3" "$out/"
+          cp -R "build/SampleGrabber_artefacts/Release/AU/Sample Grabber.component" "$out/"
+          cp LICENSE "$out/"
+          echo "$GITHUB_SHA" > "$out/BUILD.txt"
+          for b in "$out/Sample Grabber.app" "$out/Sample Grabber.vst3" "$out/Sample Grabber.component"; do
+            codesign --verify --deep --strict "$b"
+            codesign -dv "$b" 2>&1 | grep -E 'Identifier|Signature' || true
+          done
+          lipo -archs "$out/Sample Grabber.app/Contents/MacOS/Sample Grabber"
+          (cd dist && ditto -c -k --keepParent "$name" "$name.zip")
+          ls -la dist
+          echo "PKGZIP=dist/$name.zip" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sample-grabber-macos-arm64
+          path: ${{ env.PKGZIP }}
+          retention-days: 14
+
+      # Logic only loads AUs that pass Apple's validator: blocking (ran reliably on macos-26 so far)
+      - name: AU validation
+        run: |
+          set -euo pipefail
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R "build/SampleGrabber_artefacts/Release/AU/Sample Grabber.component" ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 3
+          auval -a | grep -i "Sgrb" || true
+          auval -v aumu Sgrb Wrst
+
+      # Tool installer on macOS arm64: same self tests as Windows (proc skips itself off Windows)
+      - name: Self tests
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./scripts/ci/selftests.ps1 -App "build/SampleGrabberApp_artefacts/Release/Sample Grabber.app/Contents/MacOS/Sample Grabber" -Work "${{ runner.temp }}/sg-selftest"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: selftest-macos-arm64
+          path: ${{ runner.temp }}/sg-selftest/out
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Tag v<version> or v<version>-rc<N> -> DRAFT release with exactly the files the jobs above built and tested
+  # (no rebuild). File names carry the version without the -rc suffix, so a candidate can be promoted unchanged:
+  #   gh release edit v0.1.0-rc1 --tag v0.1.0 --target <full commit sha of the rc> \
+  #     --title "Sample Grabber 0.1.0" --prerelease=false --draft=false
+  # (gh >= 2.x: "release edit" has --tag/--target/--draft/--prerelease). Publishing creates the tag v0.1.0 on that commit;
+  # the gate job above then skips the rebuild. A failing platform job means no release job, no draft.
+  release:
+    needs: [gate, windows-x64, linux-x64, macos-arm64]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.gate.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write   # only here: create the draft release and upload its files
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Release variables
+        run: |
+          set -euo pipefail
+          [ -n "${{ needs.gate.outputs.version }}" ] || { echo "::error::no version from the gate job"; exit 1; }
+          { echo "TAG=$GITHUB_REF_NAME"; echo "VER=${{ needs.gate.outputs.version }}"; echo "PRE=${{ needs.gate.outputs.prerelease }}"; } >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: sample-grabber-*
+          path: dl
+
+      - name: Collect release files
+        run: |
+          set -euo pipefail
+          find dl -maxdepth 3 | sort
+          mkdir -p rel
+          p="SampleGrabber-$VER"
+
+          # Windows installer (ISCC names it after the CMake version already)
+          setup=$(ls dl/sample-grabber-windows-x64-setup/*.exe)
+          [ "$(basename "$setup")" = "$p-windows-x64-setup.exe" ] || { echo "::error::unexpected installer name $setup"; exit 1; }
+          cp "$setup" "rel/$p-windows-x64-setup.exe"
+
+          # Windows portable: the package folder as zip with a versioned top folder
+          w=dl/sample-grabber-windows-x64
+          [ -f "$w/Sample Grabber.exe" ] && [ -f "$w/Sample Grabber.vst3/Contents/x86_64-win/Sample Grabber.vst3" ] \
+            || { echo "::error::windows package incomplete"; exit 1; }
+          mkdir -p "stage/$p-windows-x64"
+          cp -R "$w/." "stage/$p-windows-x64/"
+          (cd stage && zip -qr -X "../rel/$p-windows-x64.zip" "$p-windows-x64")
+
+          # Linux tarball from package-linux.sh (version checked, folder inside keeps the commit)
+          lin=$(ls dl/sample-grabber-linux-x64/sample-grabber-"$VER"-*-linux-x86_64.tar.gz)
+          case "$lin" in *-dirty-*) echo "::error::dirty Linux package $lin"; exit 1 ;; esac
+          cp "$lin" "rel/$p-linux-x64.tar.gz"
+
+          # macOS zip made with ditto (keeps bundle symlinks and exec bits)
+          mac=$(ls dl/sample-grabber-macos-arm64/*.zip)
+          cp "$mac" "rel/$p-macos-arm64.zip"
+
+          # install-mac.sh with this release baked in: zip name, its SHA-256 and the tags to try (final first)
+          macsum=$(sha256sum "rel/$p-macos-arm64.zip" | cut -d' ' -f1)
+          tags="v$VER"; [ "$TAG" = "v$VER" ] || tags="v$VER $TAG"
+          sed -e "s|@SG_VERSION@|$VER|g" -e "s|@SG_ZIP@|$p-macos-arm64.zip|g" \
+              -e "s|@SG_SHA256@|$macsum|g" -e "s|@SG_TAGS@|$tags|g" scripts/install-mac.sh > rel/install-mac.sh
+          if grep -q '@SG_' rel/install-mac.sh; then echo "::error::placeholder left in install-mac.sh"; exit 1; fi
+          bash -n rel/install-mac.sh
+
+          (cd rel && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          ls -la rel
+
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::a release for $TAG exists already - delete it first (gh release delete $TAG) and re-run this job"; exit 1
+          fi
+          title="Sample Grabber $VER"
+          if [ "$PRE" = true ]; then title="$title (${TAG##*-})"; fi
+          base="https://github.com/$GITHUB_REPOSITORY"
+          cat > notes.md <<NOTES
+          Sample Grabber $VER - grab audio from a link or a file, cut it, slice it across 16 pads and drag the samples into your DAW.
+          VST3 + standalone app (Windows, Linux, macOS), Audio Unit on macOS.
+
+          ## Install
+
+          | System | File | How |
+          |---|---|---|
+          | Windows 10/11 x64 | \`SampleGrabber-$VER-windows-x64-setup.exe\` | Run it. Portable alternative: \`SampleGrabber-$VER-windows-x64.zip\` (copy the \`.vst3\` into your VST3 folder) |
+          | Linux x86_64 (glibc 2.35+) | \`SampleGrabber-$VER-linux-x64.tar.gz\` | Unpack, run \`./install.sh\` (per user, no root) |
+          | macOS, Apple Silicon | \`install-mac.sh\` | In Terminal: \`curl -fsSL $base/releases/latest/download/install-mac.sh \| bash\` |
+
+          On first start press **INSTALL TOOLS** (or **INSTALL** in the settings, gear icon): yt-dlp, deno and ffmpeg are downloaded
+          from their official releases (they are not bundled). If that fails, see "Install tools manually" in the [README]($base#install-tools-manually).
+
+          ## Known limits
+
+          - Not code-signed: Windows SmartScreen warns on first start (**More info** -> **Run anyway**). On macOS the app is only
+            ad-hoc signed and not notarized: install it with the Terminal command above. A zip downloaded in a browser is
+            reported as "damaged" by Gatekeeper.
+          - macOS: Apple Silicon (M1 and newer) only, macOS 12+ recommended (the downloaded ffmpeg needs 12).
+          - BPM, key and beat slicing are estimates.
+
+          Check files: \`sha256sum -c SHA256SUMS\` (macOS: \`shasum -a 256 -c SHA256SUMS\`).
+          NOTES
+          flags="--draft"
+          if [ "$PRE" = true ]; then flags="$flags --prerelease"; fi
+          # --verify-tag: never create a tag here; --target: the release remembers the tested commit (used when promoting)
+          gh release create "$TAG" $flags --verify-tag --target "$GITHUB_SHA" --title "$title" --notes-file notes.md rel/*
+          echo "::notice::draft release $TAG created - test the files, then publish (see the comment at the release job)"
