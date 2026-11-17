@@ -175,8 +175,16 @@ void killTree (const juce::StringArray& args)
     const int self = (int) ::getpid();
     std::vector<int> tree;
     for (const auto& p : all)
-        if (p.ppid == self && argvOf (p.pid) == args)
+    {
+        if (p.ppid != self)
+            continue;
+        // A script started via shebang (e.g. Homebrew/pip yt-dlp) shows up as "<interpreter> <script> <args...>"
+        auto argv = argvOf (p.pid);
+        if (argv.size() == args.size() + 1)
+            argv.remove (0);
+        if (argv == args)
             tree.push_back (p.pid);
+    }
 
     for (size_t i = 0; i < tree.size(); ++i)   // breadth-first: append children of every collected pid
         for (const auto& p : all)

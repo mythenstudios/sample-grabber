@@ -19,7 +19,8 @@ Install (per user, no root)
   Standalone  ~/.local/bin/sample-grabber, plus an entry in the app menu
 
 Then rescan plugins in your DAW if needed (Ardour: Window > Plugin Manager > Scan).
-On first start open the gear menu and press INSTALL TOOLS, or use yt-dlp/ffmpeg from your PATH.
+On first start press INSTALL TOOLS (or INSTALL in the gear menu), or use yt-dlp/ffmpeg from your PATH.
+If that fails, see "Install tools manually" in the README: https://github.com/mythenstudios/sample-grabber#install-tools-manually
 
 Uninstall
 ---------

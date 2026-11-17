@@ -1,0 +1,122 @@
+name: canary
+
+# Daily check that INSTALL TOOLS still works: yt-dlp, deno and ffmpeg (BtbN on Windows/Linux, Martin Riedl on macOS)
+# are fetched live from upstream, so a renamed asset, a changed checksum file or a moved redirect breaks the installer
+# without any change on our side. Per platform: the tool self test (network) + the offline grab-file test (ffmpeg
+# converts a synthetic WAV). Never grabs from video sites: CI addresses get bot-blocked (false alarms).
+#
+# Lean on purpose: the app is only rebuilt when Source/, CMakeLists.txt or resources changed (actions/cache keyed by
+# their hash); on most days each job restores the binary and only runs the two tests (a few minutes, mostly download).
+# Scheduled runs use the default branch (main) only, so this starts once the file is on main. GitHub sends a mail to the
+# owner (the user who last changed the cron line) when a scheduled run fails; scheduled workflows of a public repo are
+# switched off by GitHub after 60 days without repository activity.
+on:
+  schedule:
+    - cron: "17 5 * * *"   # 05:17 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: canary
+  cancel-in-progress: false
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04   # same baseline as the release build
+    timeout-minutes: 60
+    steps:
+      - name: Git
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@v7
+
+      - name: Dependencies
+        run: bash scripts/ci/linux-deps.sh
+
+      - id: cache
+        uses: actions/cache@v6
+        with:
+          path: build/SampleGrabberApp_artefacts/Release/Sample Grabber
+          key: canary-app-linux-x64-${{ hashFiles('Source/**', 'CMakeLists.txt', 'resources/**', 'brand/**') }}
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target SampleGrabberApp
+
+      - name: Tool self test
+        run: xvfb-run -a bash scripts/ci/selftests.sh --app "build/SampleGrabberApp_artefacts/Release/Sample Grabber" --work sg-canary --only tools,grab-file
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: canary-linux-x64
+          path: sg-canary/out
+          retention-days: 7
+          if-no-files-found: ignore
+
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: cache
+        uses: actions/cache@v6
+        with:
+          path: build/SampleGrabberApp_artefacts/Release/Sample Grabber.exe
+          key: canary-app-windows-x64-${{ hashFiles('Source/**', 'CMakeLists.txt', 'resources/**', 'brand/**') }}
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release --target SampleGrabberApp --parallel
+
+      - name: Tool self test
+        shell: pwsh
+        run: ./scripts/ci/selftests.ps1 -App "build/SampleGrabberApp_artefacts/Release/Sample Grabber.exe" -Work "${{ runner.temp }}/sg-canary" -Only tools,grab-file
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: canary-windows-x64
+          path: ${{ runner.temp }}/sg-canary/out
+          retention-days: 7
+          if-no-files-found: ignore
+
+  macos-arm64:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: cache
+        uses: actions/cache@v6
+        with:
+          path: build/SampleGrabberApp_artefacts/Release/Sample Grabber.app
+          key: canary-app-macos-arm64-${{ hashFiles('Source/**', 'CMakeLists.txt', 'resources/**', 'brand/**') }}
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake --build build --target SampleGrabberApp
+
+      - name: Tool self test
+        shell: pwsh
+        run: ./scripts/ci/selftests.ps1 -App "build/SampleGrabberApp_artefacts/Release/Sample Grabber.app/Contents/MacOS/Sample Grabber" -Work "${{ runner.temp }}/sg-canary" -Only tools,grab-file
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: canary-macos-arm64
+          path: ${{ runner.temp }}/sg-canary/out
+          retention-days: 7
+          if-no-files-found: ignore

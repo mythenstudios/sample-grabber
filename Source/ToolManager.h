@@ -132,6 +132,7 @@ private:
     juce::Result commitOne (const Plan&, const Staged&);
     juce::Result download (const juce::String& url, const juce::File& dest, juce::int64 expectedSize,
                            std::function<void (juce::int64)> onBytes);
+    // Exit code; -1 = not started, -2 = killed by us (timeout/cancel), never 0 in those cases
     int runTool (const juce::StringArray& args, juce::String& output, int timeoutMs);
 
     void setStatus (const juce::String& text, float p);

@@ -105,7 +105,14 @@ namespace
        #if JUCE_WINDOWS
         const auto parts = juce::StringArray::fromTokens (juce::SystemStats::getEnvironmentVariable ("PATH", {}), ";", "\"");
        #else
-        const auto parts = juce::StringArray::fromTokens (juce::SystemStats::getEnvironmentVariable ("PATH", {}), ":", {});
+        auto parts = juce::StringArray::fromTokens (juce::SystemStats::getEnvironmentVariable ("PATH", {}), ":", {});
+       #endif
+       #if JUCE_MAC
+        // Apps started from Finder/Dock and DAWs get a minimal PATH without Homebrew -> look there too (after PATH).
+        // yt-dlp gets deno by absolute path (--js-runtimes) and ffmpeg/ffprobe by folder, so no child PATH is needed.
+        for (const char* extra : { "/opt/homebrew/bin", "/usr/local/bin" })
+            if (! parts.contains (extra) && ! parts.contains (juce::String (extra) + "/"))
+                parts.add (extra);
        #endif
         for (auto dir : parts)
         {
@@ -171,8 +178,21 @@ namespace
             && s.containsOnly ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-");
     }
 
+    // runTool(): process was killed by us (timeout or cancel). -1 = could not start.
+    constexpr int kRunToolKilled = -2;
+
+    // Install error caused by the download or its verification (network, server, checksum, signature),
+    // not by the local system (disk, tar, curl, file in use) - see doInstall()
+    bool isFetchFailure (const juce::String& why)
+    {
+        return why == kErrNoNet || why == kErrBroken || why == kErrCheck || why == kErrBusy || why == kErrSign
+            || why == "NOT FOUND ON GITHUB" || why.startsWith ("GITHUB ERROR ") || why.startsWith ("UNEXPECTED ANSWER")
+            || why.startsWith ("FFMPEG SERVER ") || why == "NO FFMPEG BUILD FOR THIS SYSTEM";
+    }
+
     juce::String curlError (int rc)
     {
+        if (rc == kRunToolKilled)         return kErrNoNet;     // our timeout: network hangs
         if (rc == 255 || rc < 0)          return kErrCurl;
         if (rc == 6 || rc == 7 || rc == 28) return kErrNoNet;   // DNS, Verbindung, Timeout
         return kErrBroken;
@@ -949,8 +969,21 @@ void ToolManager::doInstall (const juce::Array<Tool>& targets, juce::String& not
             setToolState ((Tool) i, State::missing, {});   // aborted
     }
 
-    // Summary in one line; if it does not fit (about 100 characters at 1x, Classic), use short reasons
-    auto summary = [&] (bool shortForm)
+    // Download/verification failed and the tool is still missing (not: update of a working tool, local problems
+    // like a full disk or missing tar, cancel) -> also name the way out: put the tools into the tools folder by hand
+    bool handHint = false;
+    for (int i = 0; i < reasons.size(); ++i)
+    {
+        if (! isFetchFailure (reasons[i]))
+            continue;
+        for (auto& name : failedPerReason[i])
+            for (int k = 0; k < numTools; ++k)
+                if (toolName ((Tool) k).toUpperCase() == name && getExecutable ((Tool) k) == juce::File())
+                    handHint = true;
+    }
+
+    // Summary in one line; if it does not fit (about 100 characters at 1x, Classic), use short reasons/hint
+    auto summary = [&] (bool shortForm, bool shortHint)
     {
         juce::StringArray parts;
         if (okNames.size() > 0)
@@ -966,12 +999,19 @@ void ToolManager::doInstall (const juce::Array<Tool>& targets, juce::String& not
             parts.add (failedPerReason[i].joinIntoString (" + ") + (why.contains ("FAILED") ? ": " : " FAILED: ") + why);
             retryHint = retryHint || ! reasons[i].contains ("TRY AGAIN");
         }
+        if (handHint)
+            return parts.joinIntoString (kSep) + (shortHint ? " - RETRY LATER OR ADD TOOLS BY HAND (README)"
+                                                            : " - TRY AGAIN LATER OR PUT THE TOOLS INTO THE TOOLS FOLDER (SEE README)");
         return parts.joinIntoString (kSep) + (retryHint ? " - CLICK TO RETRY" : "");
     };
     isError = reasons.size() > 0;
-    note = summary (false);
+    note = summary (false, false);
     if (note.length() > 100)
-        note = summary (true);
+        note = summary (true, false);
+    if (note.length() > 100)
+        note = summary (true, true);
+    if (note.length() > 100 && handHint)   // several different reasons: drop the details, keep the way out
+        note = "TOOLS NOT INSTALLED - RETRY LATER OR ADD TOOLS BY HAND (README)";
 }
 
 juce::Result ToolManager::getPlan (Tool t, Plan& plan, bool refetch)
@@ -1339,7 +1379,7 @@ juce::Result ToolManager::prepareOne (const Plan& plan, const juce::String& step
         if (threadShouldExit())
             return juce::Result::fail (kCancelled);
         if (rc != 0)
-            return juce::Result::fail (rc < 0 || rc == 255 ? juce::String ("TAR/XZ MISSING - INSTALL XZ-UTILS")
+            return juce::Result::fail (rc == -1 || rc == 255 ? juce::String ("TAR/XZ MISSING - INSTALL XZ-UTILS")
                                                            : juce::String ("UNPACKING FAILED"));
        #endif
 
@@ -1376,6 +1416,19 @@ juce::Result ToolManager::prepareOne (const Plan& plan, const juce::String& step
             {
                 std::cerr << "[SG-TOOLS] codesign check failed (" << rc << ") for " << s.second.toStdString() << ": "
                           << output.trim().toStdString() << std::endl;
+                return juce::Result::fail (kErrSign);
+            }
+
+            // Second, independent check: runTool cannot tell a crashed (signalled) codesign from a pass, so the
+            // signing team must also show up in the signature details (codesign -dv prints them on stderr)
+            juce::String details;
+            const int drc = runTool ({ kCodesign, "-dv", s.first.getFullPathName() }, details, 120000);
+            if (threadShouldExit())
+                return juce::Result::fail (kCancelled);
+            if (drc != 0 || ! details.contains ("TeamIdentifier=" + juce::String (kFfmpegTeamId)))
+            {
+                std::cerr << "[SG-TOOLS] codesign team check failed (" << drc << ") for " << s.second.toStdString() << ": "
+                          << details.trim().toStdString() << std::endl;
                 return juce::Result::fail (kErrSign);
             }
         }
@@ -1533,9 +1586,10 @@ juce::Result ToolManager::download (const juce::String& url, const juce::File& d
 
     if (useCurl())
     {
-        // Without -f: the error page ends up in dest (rate-limit text), status code of the last response via -w on stdout
+        // Without -f: the error page ends up in dest (rate-limit text), status code of the last response via -w on stdout.
+        // --speed-limit/--speed-time: a stalled transfer (< 1 KB/s for 60 s) ends with rc 28 instead of hanging forever.
         const juce::StringArray args { kCurl, "-sSL", "--proto", "=https", "--proto-redir", "=https",
-                                       "--connect-timeout", "20", "--retry", "2",
+                                       "--connect-timeout", "20", "--speed-limit", "1024", "--speed-time", "60", "--retry", "2",
                                        "-A", kUserAgent, "-H", "Accept: application/octet-stream, application/json",
                                        "-w", "%{http_code}", "-o", dest.getFullPathName(), url };
         bool started = false;
@@ -1612,6 +1666,14 @@ juce::Result ToolManager::download (const juce::String& url, const juce::File& d
                 onBytes (total);
         }
         out.flush();
+        // WinINet: the receive timeout (withConnectionTimeoutMs, also applied to INTERNET_OPTION_RECEIVE_TIMEOUT)
+        // ends a stalled read with 0 bytes and marks the stream as finished -> compare with Content-Length if known
+        // (Windows only: NSURLSession may decode gzip, then Content-Length would not match the bytes read)
+       #if JUCE_WINDOWS
+        const auto length = in->getTotalLength();
+        if (length > 0 && total != length)
+            return juce::Result::fail (kErrBroken);
+       #endif
         if (! in->isExhausted())
             return juce::Result::fail (kErrBroken);
     }
@@ -1638,20 +1700,28 @@ int ToolManager::runTool (const juce::StringArray& args, juce::String& output, i
     // Wait with timeout/abort; the outputs (tar errors, --version) are small and fit in the pipe buffer,
     // reading happens only after the end (readProcessOutput would block until the process ends).
     const auto deadline = juce::Time::getMillisecondCounter() + (juce::uint32) timeoutMs;
+    bool killed = false;
     while (proc->isRunning())
     {
         if (threadShouldExit() || juce::Time::getMillisecondCounter() > deadline)
         {
             const juce::ScopedLock sl (procLock);
             proc->kill();
+            killed = true;
             break;
         }
         wait (20);
     }
 
     output = proc->readAllProcessOutput();
-    proc->waitForProcessToFinish (5000);
-    const int rc = (int) proc->getExitCode();
+    const bool finished = proc->waitForProcessToFinish (5000);
+    int rc = (int) proc->getExitCode();
+    // getExitCode() is 0 for a killed process (POSIX: SIGKILL is not WIFEXITED, Windows: TerminateProcess(.., 0)),
+    // so a timed-out or cancelled codesign/tar would look like success -> report our kill as failure.
+    // Not detectable with juce::ChildProcess: a process that died from a signal WITHOUT our kill (crash, OOM killer)
+    // also reads as 0. Callers that verify something must therefore also check the result (files, output) where possible.
+    if (killed || ! finished)
+        rc = kRunToolKilled;
     {
         const juce::ScopedLock sl (procLock);
         proc.reset();

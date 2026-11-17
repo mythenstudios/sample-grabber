@@ -147,7 +147,7 @@ juce_add_gui_app(SampleGrabberApp
     COMPANY_NAME "Mythen Studios"
     BUNDLE_ID com.mythenstudios.samplegrabberapp
     ${SG_ICON_ARGS}
-    VERSION 0.1.0)
+    VERSION ${PROJECT_VERSION})   # single source: project() above
 
 target_sources(SampleGrabberApp PRIVATE Source/App/Main.cpp ${SG_SOURCES})
 target_include_directories(SampleGrabberApp PRIVATE Source)

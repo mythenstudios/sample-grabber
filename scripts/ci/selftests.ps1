@@ -3,12 +3,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 # Runs the app's built-in self tests in CI (Windows, macOS). All app folders point into a scratch directory.
-# Usage: selftests.ps1 -App <path to the app executable> -Work <scratch dir> [-Skip name,name]
+# Usage: selftests.ps1 -App <path to the app executable> -Work <scratch dir> [-Skip name,name] [-Only name,name]
 # Exit code 0 = all tests passed. Logs and snapshot PNGs end up in <Work>/out.
 param(
     [Parameter(Mandatory)] [string] $App,
     [Parameter(Mandatory)] [string] $Work,
-    [string[]] $Skip = @()   # e.g. tools,grab-file,grab-range where the tool installer is not supported yet
+    [string[]] $Skip = @(),  # e.g. tools,grab-file,grab-range where the tool installer is not supported yet
+    [string[]] $Only = @()   # run only these tests (canary: tools,grab-file)
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,7 +31,7 @@ $results = [System.Collections.Generic.List[object]]::new()
 # Runs the app once with the given variables, waits (with timeout), prints stderr, records the result
 function Invoke-SelfTest([string] $Name, [hashtable] $Vars, [int] $TimeoutSec = 120, [scriptblock] $Check = $null)
 {
-    if ($Skip -contains $Name) { Write-Host "skipped: $Name"; return }
+    if ($Skip -contains $Name -or ($Only.Count -gt 0 -and $Only -notcontains $Name)) { Write-Host "skipped: $Name"; return }
     $base = Join-Path $Work $Name
     $all = @{
         SG_CACHE_DIR  = Join-Path $base "cache"
@@ -79,8 +80,10 @@ Invoke-SelfTest "grab-range" @{ SG_GRAB_SELFTEST = $wav; SG_GRAB_RANGE = "0:02-0
 
 # Cancel while ffmpeg cuts a long file: no process of the job (whole tree) and no partial file may survive
 $longWav = Join-Path $Work "long120.wav"   # pure Python generator: keep it short for the CI runners
-& $py "$PSScriptRoot/make-test-wav.py" $longWav 120
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $longWav)) { throw "could not create the long test wav" }
+if (-not ($Skip -contains "grab-cancel" -or ($Only.Count -gt 0 -and $Only -notcontains "grab-cancel"))) {
+    & $py "$PSScriptRoot/make-test-wav.py" $longWav 120
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $longWav)) { throw "could not create the long test wav" }
+}
 Invoke-SelfTest "grab-cancel" @{ SG_GRAB_SELFTEST = $longWav; SG_GRAB_RANGE = "0:05-1:55"; SG_GRAB_CANCEL_AFTER = "40" } -TimeoutSec 120
 
 foreach ($theme in "dark", "classic")
